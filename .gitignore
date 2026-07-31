@@ -1,0 +1,42 @@
+# Secrets / local env (keep .env.example)
+.env
+.env.local
+.env.*.local
+*.pem
+credentials/
+**/credentials/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Test / type / coverage caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Playwright / browser artifacts
+playwright-report/
+test-results/
+.auth/

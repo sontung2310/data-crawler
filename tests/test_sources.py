@@ -174,22 +174,6 @@ def _build_extra_options(*, with_comments: bool) -> List[ExtraOption]:
             ),
         ),
         ExtraOption(
-            name="reddit_playwright (search/top)",
-            group="reddit_playwright",
-            items_key="posts",
-            runner=lambda q, lim: reddit_playwright.fetch(
-                q, limit=lim, sort="top", time_filter="week"
-            ),
-        ),
-        ExtraOption(
-            name="reddit_playwright (search/new)",
-            group="reddit_playwright",
-            items_key="posts",
-            runner=lambda q, lim: reddit_playwright.fetch(
-                q, limit=lim, sort="new"
-            ),
-        ),
-        ExtraOption(
             name="reddit_playwright (subreddit/hot)",
             group="reddit_playwright",
             items_key="posts",

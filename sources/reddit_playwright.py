@@ -1337,6 +1337,7 @@ def enrich_posts_with_comments(
         raise
     except Exception as exc:
         logger.exception("reddit_playwright enrich failed: %s", exc)
+        raise
     return out
 
 

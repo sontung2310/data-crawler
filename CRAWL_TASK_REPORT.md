@@ -132,12 +132,12 @@ Unique content key: `(source, external_id)`. Top-level `query` is the crawl keyw
 
 ### X / Reddit search modes (API path)
 
-`POST /crawl` for `x_playwright` / `reddit_playwright` runs **multi-mode discovery**, then dedupes before comment enrichment:
+`POST /crawl` for `x_playwright` / `reddit_playwright` discovers posts, then dedupes before comment enrichment:
 
 | Adapter | Modes | Fresh-mode filter |
 |---------|--------|-------------------|
 | X | `top` + `live` | `live`: `min_replies >= 10` |
-| Reddit | `top` + `new` + `hot` | `new`: `engagement.comments >= 10` |
+| Reddit | `relevance` only | — |
 
 `limit` = max unique posts after merge. Default comments per post (when unset): **200** for X/Reddit (YouTube remains 50).
 

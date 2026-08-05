@@ -116,7 +116,7 @@ Collections: `raw_posts`, `raw_comments`, `crawl_tasks`.
 
 Unique key for content: `(source, external_id)`. Each row includes `query` (crawl keyword) and may include `task_id`.
 
-X/Reddit via the API use multi-mode search (`top`+`live` / `top`+`new`+`hot`), dedupe by post id before comment crawl, and skip low-discussion posts on fresh modes (`live`/`new`, ≥10 comments). Default comment hard cap for X/Reddit is 200.
+X/Reddit via the API: X uses multi-mode search (`top`+`live`); Reddit query search is **relevance-only**. Both dedupe by post id before comment crawl. X skips low-discussion posts on `live` (`min_replies >= 10`). Default comment hard cap for X/Reddit is 200.
 
 ## Relevance eval
 

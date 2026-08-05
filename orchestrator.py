@@ -39,7 +39,7 @@ _x_slots = threading.Semaphore(max(1, CRAWL_PW_X_SLOTS))
 _reddit_slots = threading.Semaphore(max(1, CRAWL_PW_REDDIT_SLOTS))
 _executor = ThreadPoolExecutor(max_workers=max(1, CRAWL_MAX_WORKERS))
 
-# Fresh modes (X live / Reddit new): only keep posts with enough discussion.
+# Fresh modes (X live): only keep posts with enough discussion.
 _MIN_COMMENTS_FRESH = 10
 
 
@@ -249,7 +249,7 @@ def create_accepted_task(
             "limit": limit,
             "search_modes": {
                 "x_playwright": ["top", "live"],
-                "reddit_playwright": ["relevance", "top", "new", "hot"],
+                "reddit_playwright": ["relevance"],
             },
             "min_comments_fresh": _MIN_COMMENTS_FRESH,
         },
@@ -356,15 +356,6 @@ def _dedupe_posts(posts: List[dict]) -> List[dict]:
     return unique
 
 
-def _comment_count(row: dict) -> int:
-    eng = row.get("engagement") or {}
-    raw = eng.get("comments")
-    try:
-        return int(raw) if raw is not None else 0
-    except (TypeError, ValueError):
-        return 0
-
-
 def _fetch_x_multi_mode(
     query: str,
     limit: int,
@@ -410,29 +401,19 @@ def _fetch_reddit_multi_mode(
 ) -> None:
     from sources import reddit_playwright
 
-    modes = ("relevance", "top", "new", "hot")
-    collected: List[dict] = []
-
-    for sort in modes:
-        # Oversample "new" so we still fill limit after >=10 comments filter.
-        discover_limit = limit * 3 if sort == "new" else limit
-        result = reddit_playwright.fetch(
-            query,
-            limit=discover_limit,
-            sort=sort,
-            time_filter=time_filter if sort in ("top", "relevance") else None,
-            listing_only=True,
-        )
-        posts, _ = _normalize_fetch_result(result)
-        if sort == "new":
-            posts = [p for p in posts if _comment_count(p) >= _MIN_COMMENTS_FRESH]
-        collected.extend(posts)
-
-    unique = _dedupe_posts(collected)[:limit]
+    # Query path: relevance-only (hot/top/new search ranks weakly for intent match).
+    result = reddit_playwright.fetch(
+        query,
+        limit=limit,
+        sort="relevance",
+        time_filter=time_filter,
+        listing_only=True,
+    )
+    posts, _ = _normalize_fetch_result(result)
+    unique = _dedupe_posts(posts)[:limit]
     logger.info(
-        "reddit_playwright multi-mode modes=%s collected=%d unique=%d limit=%d",
-        list(modes),
-        len(collected),
+        "reddit_playwright relevance-only collected=%d unique=%d limit=%d",
+        len(posts),
         len(unique),
         limit,
     )
@@ -573,7 +554,7 @@ def run_crawl_task(
             "limit": limit,
             "search_modes": {
                 "x_playwright": ["top", "live"],
-                "reddit_playwright": ["relevance", "top", "new", "hot"],
+                "reddit_playwright": ["relevance"],
             },
             "min_comments_fresh": _MIN_COMMENTS_FRESH,
         },

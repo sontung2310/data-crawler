@@ -23,7 +23,7 @@ Search:
                             ISO region code (e.g. AU, US). Also accepts AUS, USA, Australia
   --published-after-days N  Only videos newer than N days (default: 60; 0 = no filter)
   --order {viewCount,date,rating,relevance,title,videoCount}
-                            Search order (default: viewCount)
+                            Search order (default: relevance)
   --include-comments        Also crawl comments for each video
   --num-comment-crawl N     Max top-level comments per video (default: all up to cap 50)
   --get-replies             Also fetch replies under each top-level comment
@@ -62,7 +62,13 @@ from typing import Any, Dict, List, Optional, TypedDict
 import requests
 
 from config import YOUTUBE_API_KEY
-from .utils import crawled_at_now, resolve_limit
+from .utils import (
+    crawled_at_now,
+    filter_rows_by_query,
+    keyword_search_query,
+    overfetch_limit,
+    resolve_limit,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +80,7 @@ YOUTUBE_PUBLISHED_AFTER_DAYS: Optional[int] = None
 YOUTUBE_MAX_RESULTS_PER_PAGE = 50
 YOUTUBE_TRENDING_AGE_EXPONENT = 0.6
 YOUTUBE_DEFAULT_PUBLISHED_AFTER_DAYS = 60
-YOUTUBE_DEFAULT_ORDER = "viewCount"
+YOUTUBE_DEFAULT_ORDER = "relevance"
 # Hard safety cap: max top-level comment threads fetched per video.
 YOUTUBE_COMMENTS_HARD_CAP = 50
 # When False, only top-level comments are returned (no replies).
@@ -780,23 +786,26 @@ class YouTubeSearchCrawler:
         if not self.client.api_configured():
             raise RuntimeError("YOUTUBE_API_KEY must be set in .env")
 
-        limit = resolve_limit(limit, hard_cap=50) or 50
+        want = resolve_limit(limit, hard_cap=50) or 50
+        fetch_n = overfetch_limit(want, hard_cap=50) or want
+        search_q = keyword_search_query(query) or query
         resolved_order = self.client.resolve_order(order)
         resolved_region = self.client.resolve_region(region_code, location)
         days = self.client.resolve_published_after_days(published_after_days)
         published_after = self.client.days_to_published_after_rfc3339(days)
 
         video_ids = self.client.search_video_ids(
-            query,
-            limit=limit,
+            search_q,
+            limit=fetch_n,
             order=resolved_order,
             region_code=resolved_region,
             published_after=published_after,
         )
         if not video_ids:
             logger.info(
-                "youtube_api search returned 0 ids for query=%r region=%s",
+                "youtube_api search returned 0 ids for query=%r shaped=%r region=%s",
                 query,
+                search_q,
                 resolved_region,
             )
             return empty_crawl_result()
@@ -805,7 +814,8 @@ class YouTubeSearchCrawler:
         by_id = {item.get("id"): item for item in video_items if item.get("id")}
         ordered_items = [by_id[vid] for vid in video_ids if vid in by_id]
 
-        videos = enrich_and_map(self.client, ordered_items, SOURCE_KEY_SEARCH)[:limit]
+        videos = enrich_and_map(self.client, ordered_items, SOURCE_KEY_SEARCH)
+        videos = filter_rows_by_query(videos, query, limit=want, soft=True)
         if on_item:
             for video in videos:
                 on_item("post", video)
@@ -823,10 +833,11 @@ class YouTubeSearchCrawler:
 
         logger.info(
             "youtube_api search fetched %d videos / %d comments for query=%r "
-            "order=%s region=%s days=%s include_comments=%s get_replies=%s",
+            "shaped=%r order=%s region=%s days=%s include_comments=%s get_replies=%s",
             len(videos),
             len(comments),
             query,
+            search_q,
             resolved_order,
             resolved_region,
             days,

@@ -63,7 +63,7 @@ docker run --rm -p 8000:8000 --shm-size=1gb \
 
 | Field | Notes |
 |-------|--------|
-| `query` | Required keyword (same string for every adapter) |
+| `query` | Required **search keywords** (same string for every adapter). Prefer short phrases over chat questions — see [QUERY_GUIDANCE.md](QUERY_GUIDANCE.md) |
 | `source` | `x` \| `reddit` \| `youtube` \| `duckduckgo` \| `news` \| `all` (omit = all) |
 | `time_delta` | `1`/`7`/`30`/`365` or `hour`/`day`/`week`/`month`/`year` |
 | `limit` | Max posts per adapter (default 50). Comments always included for X/Reddit/YouTube |
@@ -114,7 +114,18 @@ On expiry / login wall: task error `session_expired`, log line, and optional ema
 
 Collections: `raw_posts`, `raw_comments`, `crawl_tasks`.
 
-Unique key for content: `(source, external_id)`. Each row may include `task_id`.
+Unique key for content: `(source, external_id)`. Each row includes `query` (crawl keyword) and may include `task_id`.
+
+X/Reddit via the API: X uses multi-mode search (`top`+`live`); Reddit query search is **relevance-only**. Both dedupe by post id before comment crawl. X skips low-discussion posts on `live` (`min_replies >= 10`). Default comment hard cap for X/Reddit is 200.
+
+## Relevance eval
+
+```bash
+python -m tests.eval_relevent --query "AI trending in Marketing" --limit 10
+python -m tests.eval_relevent --query "AI" --source x_playwright --json report.json
+```
+
+Requires `OPENAI_API_KEY` (model default `gpt-5.6-luna` via `EVAL_MODEL`). Crawls adapters directly — no Mongo writes.
 
 ## SQS
 

@@ -9,6 +9,8 @@ from .utils import (
     is_website_url,
     clean_html_to_text,
     limit_reached,
+    keyword_search_query,
+    text_matches_intent,
 )
 
 logger = logging.getLogger(__name__)
@@ -53,7 +55,14 @@ def fetch(query: str, limit: Optional[int] = None) -> List[Dict]:
     headers = {"User-Agent": REDDIT_USER_AGENT, "Authorization": f"Bearer {token}"}
     # Reddit search max page size is 100; over-fetch then filter when limited
     api_limit = 100 if limit is None else min(max(limit, 1) * 3, 100)
-    params = {"q": query, "sort": "new", "limit": api_limit, "type": "link", "restrict_sr": "off"}
+    q = keyword_search_query(query) or query
+    params = {
+        "q": q,
+        "sort": "relevance",
+        "limit": api_limit,
+        "type": "link",
+        "restrict_sr": "off",
+    }
     try:
         r = requests.get("https://oauth.reddit.com/search", headers=headers, params=params, timeout=15)
         r.raise_for_status()
@@ -66,8 +75,12 @@ def fetch(query: str, limit: Optional[int] = None) -> List[Dict]:
     for child in data.get("data", {}).get("children", []):
         post_data = child.get("data", {}) or {}
         mapped = _map(post_data)
-        if mapped:
-            out.append(mapped)
-            if limit_reached(len(out), limit):
-                break
+        if not mapped:
+            continue
+        hay = f"{mapped.get('title') or ''} {mapped.get('text') or ''}"
+        if query and not text_matches_intent(hay, query):
+            continue
+        out.append(mapped)
+        if limit_reached(len(out), limit):
+            break
     return out

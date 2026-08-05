@@ -22,7 +22,7 @@ Search (keyword):
 
   --query TEXT
   --limit N
-  --sort {relevance,hot,top,new,comments}
+  --sort {relevance,hot,top,new,comments}   (default: relevance)
   --time-filter {hour,day,week,month,year}
   --include-comments
   --num-comment-crawl N
@@ -43,10 +43,13 @@ Subreddit:
 
 Examples:
   python -m api.sources.reddit_playwright search --query "SEO" --limit 5
-      --sort top --time-filter week --include-comments --get-replies --json
+      --include-comments --get-replies --json
 
   python -m api.sources.reddit_playwright search --query "AI in Marketing" --limit 5
-      --sort top --time-filter week --include-comments --num-comment-crawl 3 --json
+      --sort relevance --time-filter week --include-comments --num-comment-crawl 3 --json
+
+  python -m api.sources.reddit_playwright search --query "SEO" --limit 5
+      --sort top --time-filter week --include-comments --get-replies --json
 
   python -m api.sources.reddit_playwright subreddit --subreddit r/digital_marketing
       --limit 5 --sort hot --include-comments --num-comment-crawl 3 --get-replies --json
@@ -71,7 +74,10 @@ from playwright.sync_api import sync_playwright
 from .utils import (
     clean_html_to_text,
     crawled_at_now,
+    filter_rows_by_query,
     human_delay,
+    keyword_search_query,
+    overfetch_limit,
     parse_engagement_count,
     resolve_limit,
     truncate_title,
@@ -96,7 +102,7 @@ REDDIT_COMMENT_PAGE_DELAY_MAX = 4.5
 REDDIT_COMMENT_SCROLL_MAX = 6
 REDDIT_MORE_COMMENTS_CLICKS = 8
 
-REDDIT_COMMENTS_HARD_CAP = 50
+REDDIT_COMMENTS_HARD_CAP = 200
 REDDIT_GET_REPLIES = False
 
 SOURCE_KEY_SEARCH = "reddit_playwright"
@@ -117,6 +123,8 @@ SUBREDDIT_NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
 ALLOWED_SEARCH_SORTS = {"relevance", "hot", "top", "new", "comments"}
 ALLOWED_SUBREDDIT_SORTS = {"hot", "top", "new", "best", "rising"}
 ALLOWED_TIME_FILTERS = {"hour", "day", "week", "month", "year"}
+# Default for keyword search (Posts tab). Subreddit listings keep Reddit's own default.
+DEFAULT_SEARCH_SORT = "relevance"
 SEARCH_TIME_SORTS = {"top", "relevance"}
 SUBREDDIT_TIME_SORTS = {"top"}
 
@@ -198,7 +206,7 @@ def apply_time_filter(
     t = normalize_time_filter(time_filter)
     if t is None:
         return None
-    effective_sort = sort or ("hot" if mode == "subreddit" else "relevance")
+    effective_sort = sort or ("hot" if mode == "subreddit" else DEFAULT_SEARCH_SORT)
     if effective_sort not in allowed_sorts:
         logger.warning(
             "reddit_playwright: ignoring time_filter=%s for %s sort=%s "
@@ -359,6 +367,7 @@ class RedditPlaywrightClient:
         num_comment_crawl: Optional[int] = None,
         get_replies: Optional[bool] = None,
         on_item=None,
+        listing_only: bool = False,
     ) -> CrawlResult:
         if not self.session_configured():
             raise SessionExpiredError(
@@ -382,6 +391,15 @@ class RedditPlaywrightClient:
 
                 posts = self._navigate_and_collect(page, feed_url, limit, source_key)
                 out["posts"] = posts
+
+                # Listing-only: skip post-page visits (used by multi-mode discovery).
+                if listing_only:
+                    if on_item:
+                        for post in posts:
+                            on_item("post", post)
+                    context.close()
+                    browser.close()
+                    return out
 
                 # One visit per post: enrich metadata; optionally collect comments.
                 # Persist posts after enrich (via on_item inside visit_posts).
@@ -1153,13 +1171,11 @@ class RedditSearchCrawler:
         if not q:
             raise ValueError("search query is required")
 
-        sort_n = normalize_sort(sort, ALLOWED_SEARCH_SORTS, "search")
+        sort_n = normalize_sort(sort, ALLOWED_SEARCH_SORTS, "search") or DEFAULT_SEARCH_SORT
         t = apply_time_filter(time_filter, sort_n, SEARCH_TIME_SORTS, "search")
 
         # type=link keeps the Posts tab (not communities/comments/media).
-        params: Dict[str, str] = {"q": q, "type": "link"}
-        if sort_n:
-            params["sort"] = sort_n
+        params: Dict[str, str] = {"q": q, "type": "link", "sort": sort_n}
         if t:
             params["t"] = t
 
@@ -1176,18 +1192,25 @@ class RedditSearchCrawler:
         num_comment_crawl: Optional[int] = None,
         get_replies: Optional[bool] = None,
         on_item=None,
+        listing_only: bool = False,
     ) -> CrawlResult:
-        url = self.build_url(query, sort=sort, time_filter=time_filter)
-        logger.info("reddit_playwright search url=%s", url)
-        return self.client.crawl_feed_and_comments(
+        search_q = keyword_search_query(query) or (query or "").strip()
+        want = resolve_limit(limit, hard_cap=None)
+        fetch_n = overfetch_limit(want) if want is not None else limit
+        url = self.build_url(search_q, sort=sort, time_filter=time_filter)
+        logger.info("reddit_playwright search url=%s shaped=%r", url, search_q)
+        result = self.client.crawl_feed_and_comments(
             url,
-            limit,
+            fetch_n,
             SOURCE_KEY_SEARCH,
             include_comments=include_comments,
             num_comment_crawl=num_comment_crawl,
             get_replies=get_replies,
             on_item=on_item,
+            listing_only=listing_only,
         )
+        posts = filter_rows_by_query(result.get("posts") or [], query, limit=want, soft=True)
+        return {"posts": posts, "comments": result.get("comments") or []}
 
 
 class RedditSubredditCrawler:
@@ -1254,6 +1277,7 @@ def fetch(
     num_comment_crawl: Optional[int] = None,
     get_replies: Optional[bool] = None,
     on_item=None,
+    listing_only: bool = False,
 ) -> CrawlResult:
     """Keyword search — always returns {"posts": [...], "comments": [...]}."""
     return _search_crawler.fetch(
@@ -1265,7 +1289,56 @@ def fetch(
         num_comment_crawl=num_comment_crawl,
         get_replies=get_replies,
         on_item=on_item,
+        listing_only=listing_only,
     )
+
+
+def enrich_posts_with_comments(
+    posts: List[Dict],
+    *,
+    include_comments: bool = True,
+    num_comment_crawl: Optional[int] = None,
+    get_replies: Optional[bool] = None,
+    on_item=None,
+) -> CrawlResult:
+    """Visit unique posts once: enrich + optional comments (multi-mode enrich pass)."""
+    out = empty_crawl_result()
+    out["posts"] = list(posts or [])
+    if not out["posts"]:
+        return out
+
+    client = RedditPlaywrightClient()
+    if not client.session_configured():
+        raise SessionExpiredError(
+            "reddit_playwright",
+            "REDDIT_SESSION must be set in .env",
+        )
+
+    try:
+        with sync_playwright() as playwright:
+            browser: Browser = playwright.chromium.launch(headless=REDDIT_HEADLESS)
+            context: BrowserContext = browser.new_context(
+                viewport={"width": 1280, "height": 800},
+                user_agent=DESKTOP_UA,
+            )
+            context.add_cookies(client.build_cookies())
+            page = context.new_page()
+            out["comments"] = RedditCommentsCrawler(client).visit_posts(
+                page,
+                out["posts"],
+                include_comments=include_comments,
+                num_comment_crawl=num_comment_crawl,
+                get_replies=get_replies,
+                on_item=on_item,
+            )
+            context.close()
+            browser.close()
+    except SessionExpiredError:
+        raise
+    except Exception as exc:
+        logger.exception("reddit_playwright enrich failed: %s", exc)
+        raise
+    return out
 
 
 def fetch_subreddit(
@@ -1337,19 +1410,24 @@ def _add_comment_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_filter_args(
-    parser: argparse.ArgumentParser, *, sort_choices: List[str]
+    parser: argparse.ArgumentParser, *, sort_choices: List[str], default_sort: Optional[str] = None
 ) -> None:
+    help_sort = (
+        f"Sort order (default: {default_sort})"
+        if default_sort
+        else "Sort order (default: Reddit default / omit from URL)"
+    )
     parser.add_argument(
         "--sort",
-        default=None,
+        default=default_sort,
         choices=sort_choices,
-        help="Sort order (default: Reddit default / omit from URL)",
+        help=help_sort,
     )
     parser.add_argument(
         "--time-filter",
         default=None,
         choices=sorted(ALLOWED_TIME_FILTERS),
-        help="Time window &t= (mainly for sort=top; ignored otherwise with a warning)",
+        help="Time window &t= (for sort=top or sort=relevance; ignored otherwise with a warning)",
     )
 
 
@@ -1370,7 +1448,11 @@ def _cli_main(argv: Optional[List[str]] = None) -> int:
         "--query", default="news", help='Search query (default: "news")'
     )
     search_parser.add_argument("--limit", type=int, default=5, help="Max posts to fetch")
-    _add_filter_args(search_parser, sort_choices=sorted(ALLOWED_SEARCH_SORTS))
+    _add_filter_args(
+        search_parser,
+        sort_choices=sorted(ALLOWED_SEARCH_SORTS),
+        default_sort=DEFAULT_SEARCH_SORT,
+    )
     _add_comment_args(search_parser)
     search_parser.add_argument("--json", action="store_true", help="Print full JSON output")
 

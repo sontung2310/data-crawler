@@ -79,7 +79,9 @@ def persist_raw_posts(rows: Iterable[dict]) -> Tuple[int, int]:
         payload = p.get("payload") if isinstance(p.get("payload"), dict) else None
         body = dict(payload) if payload else {k: v for k, v in p.items() if k not in ("payload",)}
 
+        query = (p.get("query") or body.get("query") or "").strip() or None
         doc_set = {
+            "query": query,
             "source": source,
             "external_id": external_id,
             "url": (body.get("url") or p.get("url") or "").strip() or None,
@@ -144,7 +146,9 @@ def persist_raw_comments(rows: Iterable[dict]) -> Tuple[int, int]:
         payload = p.get("payload") if isinstance(p.get("payload"), dict) else None
         body = dict(payload) if payload else {k: v for k, v in p.items() if k not in ("payload",)}
 
+        query = (p.get("query") or body.get("query") or "").strip() or None
         doc_set = {
+            "query": query,
             "source": source,
             "external_id": external_id,
             "comment_id": body.get("comment_id") or external_id,

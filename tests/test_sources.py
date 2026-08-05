@@ -166,6 +166,14 @@ def _build_extra_options(*, with_comments: bool) -> List[ExtraOption]:
             ),
         ),
         ExtraOption(
+            name="reddit_playwright (search/relevance)",
+            group="reddit_playwright",
+            items_key="posts",
+            runner=lambda q, lim: reddit_playwright.fetch(
+                q, limit=lim, sort="relevance"
+            ),
+        ),
+        ExtraOption(
             name="reddit_playwright (search/top)",
             group="reddit_playwright",
             items_key="posts",
@@ -239,7 +247,7 @@ def _build_extra_options(*, with_comments: bool) -> List[ExtraOption]:
                     runner=lambda q, lim: reddit_playwright.fetch(
                         q,
                         limit=min(lim, 2),
-                        sort="top",
+                        sort="relevance",
                         time_filter="week",
                         include_comments=True,
                         num_comment_crawl=3,
@@ -313,7 +321,10 @@ def _run_adapter(name: str, fetch_fn: Callable, query: str, limit: int) -> Sourc
 
     started = time.perf_counter()
     try:
-        payload = fetch_fn(query, limit=limit)
+        kwargs: Dict[str, Any] = {"limit": limit}
+        if name == "reddit_playwright":
+            kwargs["sort"] = reddit_playwright.DEFAULT_SEARCH_SORT
+        payload = fetch_fn(query, **kwargs)
         duration_ms = int((time.perf_counter() - started) * 1000)
     except Exception as exc:
         duration_ms = int((time.perf_counter() - started) * 1000)
@@ -607,6 +618,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(
             f"Extra defaults: X profile=@{DEFAULT_X_PROFILE}, "
             f"Reddit subreddit=r/{DEFAULT_REDDIT_SUBREDDIT}, "
+            f"Reddit search sort={reddit_playwright.DEFAULT_SEARCH_SORT}, "
             f"YouTube region={DEFAULT_YOUTUBE_REGION}"
         )
 

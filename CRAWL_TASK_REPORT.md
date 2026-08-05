@@ -125,10 +125,21 @@ Crawl results are **not** returned as a big JSON dump of posts. Status returns p
 
 ### Stored content shapes (Mongo)
 
-**Post (simplified):** `post_id`, `source`, `url`, `title`, `text`, `author`, `published_ts`, `engagement`, `task_id`, …  
-**Comment (simplified):** `comment_id`, `source`, `parent_content_id`, `parent_content_url`, `author`, `text`, `like_count`, `reply_count`, `parent_comment_id`, `published_ts`, `task_id`, …
+**Post (simplified):** `query`, `post_id`, `source`, `url`, `title`, `text`, `author`, `published_ts`, `engagement`, `task_id`, …  
+**Comment (simplified):** `query`, `comment_id`, `source`, `parent_content_id`, `parent_content_url`, `author`, `text`, `like_count`, `reply_count`, `parent_comment_id`, `published_ts`, `task_id`, …
 
-Unique content key: `(source, external_id)`.
+Unique content key: `(source, external_id)`. Top-level `query` is the crawl keyword that produced the row.
+
+### X / Reddit search modes (API path)
+
+`POST /crawl` for `x_playwright` / `reddit_playwright` runs **multi-mode discovery**, then dedupes before comment enrichment:
+
+| Adapter | Modes | Fresh-mode filter |
+|---------|--------|-------------------|
+| X | `top` + `live` | `live`: `min_replies >= 10` |
+| Reddit | `top` + `new` + `hot` | `new`: `engagement.comments >= 10` |
+
+`limit` = max unique posts after merge. Default comments per post (when unset): **200** for X/Reddit (YouTube remains 50).
 
 ---
 

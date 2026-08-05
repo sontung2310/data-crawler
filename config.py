@@ -32,6 +32,10 @@ GUARDIAN_API_KEY = os.environ.get("GUARDIAN_API_KEY")
 NEWSAPI_KEY = os.environ.get("NEWSAPI_KEY")
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY")
 
+# OpenAI (relevance eval)
+OPENAI_API_KEY = (os.environ.get("OPENAI_API_KEY") or "").strip()
+EVAL_MODEL = (os.environ.get("EVAL_MODEL") or "gpt-5.6-luna").strip()
+
 # Reddit OAuth (official / utils)
 REDDIT_CLIENT_ID = os.environ.get("REDDIT_CLIENT_ID")
 REDDIT_CLIENT_SECRET = os.environ.get("REDDIT_CLIENT_SECRET")

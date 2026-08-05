@@ -39,6 +39,9 @@ _x_slots = threading.Semaphore(max(1, CRAWL_PW_X_SLOTS))
 _reddit_slots = threading.Semaphore(max(1, CRAWL_PW_REDDIT_SLOTS))
 _executor = ThreadPoolExecutor(max_workers=max(1, CRAWL_MAX_WORKERS))
 
+# Fresh modes (X live / Reddit new): only keep posts with enough discussion.
+_MIN_COMMENTS_FRESH = 10
+
 
 def normalize_time_delta(value: Any) -> Optional[str]:
     """API time_delta → canonical hour|day|week|month|year (or day-count soft filter via days)."""
@@ -239,7 +242,17 @@ def create_accepted_task(
         task_id,
         query,
         adapters,
-        {"source": source, "time_delta": time_delta, "time_filter": time_filter, "limit": limit},
+        {
+            "source": source,
+            "time_delta": time_delta,
+            "time_filter": time_filter,
+            "limit": limit,
+            "search_modes": {
+                "x_playwright": ["top", "live"],
+                "reddit_playwright": ["relevance", "top", "new", "hot"],
+            },
+            "min_comments_fresh": _MIN_COMMENTS_FRESH,
+        },
         status="accepted",
         persist_now=True,
     )
@@ -254,11 +267,14 @@ def _make_on_item(task: TaskState, adapter_name: str) -> Callable[[str, dict], N
             return
         try:
             if kind == "post":
+                row = dict(row)
+                row["query"] = task.query
                 external_id = external_id_for_post(row)
                 source = (row.get("source") or "").strip()
                 if not source or not external_id:
                     return
                 doc = {
+                    "query": task.query,
                     "source": source,
                     "external_id": external_id,
                     "task_id": task.task_id,
@@ -274,11 +290,14 @@ def _make_on_item(task: TaskState, adapter_name: str) -> Callable[[str, dict], N
                     except Exception as exc:
                         task.add_warning(adapter_name, "sqs_error", str(exc))
             elif kind == "comment":
+                row = dict(row)
+                row["query"] = task.query
                 external_id = external_id_for_comment(row)
                 source = (row.get("source") or "").strip()
                 if not source or not external_id:
                     return
                 doc = {
+                    "query": task.query,
                     "source": source,
                     "external_id": external_id,
                     "task_id": task.task_id,
@@ -315,6 +334,113 @@ def _make_on_item(task: TaskState, adapter_name: str) -> Callable[[str, dict], N
     return on_item
 
 
+def _post_id_key(row: dict) -> str:
+    """Stable id for in-memory dedupe across search modes."""
+    post_id = (row.get("post_id") or "").strip()
+    if ":" in post_id:
+        post_id = post_id.rsplit(":", 1)[-1]
+    if post_id:
+        return post_id
+    return (row.get("url") or "").strip()
+
+
+def _dedupe_posts(posts: List[dict]) -> List[dict]:
+    seen: set[str] = set()
+    unique: List[dict] = []
+    for row in posts:
+        key = _post_id_key(row)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(row)
+    return unique
+
+
+def _comment_count(row: dict) -> int:
+    eng = row.get("engagement") or {}
+    raw = eng.get("comments")
+    try:
+        return int(raw) if raw is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _fetch_x_multi_mode(
+    query: str,
+    limit: int,
+    time_filter: Optional[str],
+    on_item: Callable[[str, dict], None],
+) -> None:
+    from sources import x_playwright
+    from sources.utils import time_filter_since_date
+
+    since = time_filter_since_date(time_filter) if time_filter else None
+    modes = ("top", "live")
+    collected: List[dict] = []
+
+    for filt in modes:
+        kwargs: Dict[str, Any] = {
+            "search_filter": filt,
+            "since": since,
+            "include_comments": False,
+            "limit": limit,
+        }
+        if filt == "live":
+            kwargs["min_replies"] = _MIN_COMMENTS_FRESH
+        result = x_playwright.fetch(query, **kwargs)
+        posts, _ = _normalize_fetch_result(result)
+        collected.extend(posts)
+
+    unique = _dedupe_posts(collected)[:limit]
+    logger.info(
+        "x_playwright multi-mode modes=%s collected=%d unique=%d limit=%d",
+        list(modes),
+        len(collected),
+        len(unique),
+        limit,
+    )
+    x_playwright.enrich_posts_with_comments(unique, on_item=on_item)
+
+
+def _fetch_reddit_multi_mode(
+    query: str,
+    limit: int,
+    time_filter: Optional[str],
+    on_item: Callable[[str, dict], None],
+) -> None:
+    from sources import reddit_playwright
+
+    modes = ("relevance", "top", "new", "hot")
+    collected: List[dict] = []
+
+    for sort in modes:
+        # Oversample "new" so we still fill limit after >=10 comments filter.
+        discover_limit = limit * 3 if sort == "new" else limit
+        result = reddit_playwright.fetch(
+            query,
+            limit=discover_limit,
+            sort=sort,
+            time_filter=time_filter if sort in ("top", "relevance") else None,
+            listing_only=True,
+        )
+        posts, _ = _normalize_fetch_result(result)
+        if sort == "new":
+            posts = [p for p in posts if _comment_count(p) >= _MIN_COMMENTS_FRESH]
+        collected.extend(posts)
+
+    unique = _dedupe_posts(collected)[:limit]
+    logger.info(
+        "reddit_playwright multi-mode modes=%s collected=%d unique=%d limit=%d",
+        list(modes),
+        len(collected),
+        len(unique),
+        limit,
+    )
+    reddit_playwright.enrich_posts_with_comments(
+        unique, include_comments=True, on_item=on_item
+    )
+
+
 def _call_adapter(
     name: str,
     query: str,
@@ -324,38 +450,14 @@ def _call_adapter(
 ) -> None:
     meta = REGISTRY[name]
     fetch = meta["fetch"]
-    supports_comments = bool(meta["supports_comments"])
     days = time_filter_to_days(time_filter)
 
-    kwargs: Dict[str, Any] = {}
-    # Inspect-ish: pass common kwargs; adapters ignore unknown only if **kwargs — ours don't.
-    # Call with known signatures per category.
     if name == "x_playwright":
-        from sources.utils import time_filter_since_date
-
-        since = time_filter_since_date(time_filter) if time_filter else None
-        result = fetch(
-            query,
-            limit=limit,
-            since=since,
-            include_comments=True,
-            on_item=on_item,
-        )
-        posts, _ = _normalize_fetch_result(result)
-        # on_item already fired inside; soft-filter not applied mid-stream — ok
-        _ = posts
+        _fetch_x_multi_mode(query, limit, time_filter, on_item)
         return
 
     if name == "reddit_playwright":
-        result = fetch(
-            query,
-            limit=limit,
-            time_filter=time_filter,
-            sort="top" if time_filter else None,
-            include_comments=True,
-            on_item=on_item,
-        )
-        _ = result
+        _fetch_reddit_multi_mode(query, limit, time_filter, on_item)
         return
 
     if name == "youtube_api":
@@ -464,7 +566,17 @@ def run_crawl_task(
         task_id,
         query,
         adapters,
-        {"source": source, "time_delta": time_delta, "time_filter": time_filter, "limit": limit},
+        {
+            "source": source,
+            "time_delta": time_delta,
+            "time_filter": time_filter,
+            "limit": limit,
+            "search_modes": {
+                "x_playwright": ["top", "live"],
+                "reddit_playwright": ["relevance", "top", "new", "hot"],
+            },
+            "min_comments_fresh": _MIN_COMMENTS_FRESH,
+        },
         status="running",
         persist_now=True,
     )

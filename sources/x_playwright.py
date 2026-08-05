@@ -26,7 +26,7 @@ Search:
   --min-faves N
   --min-retweets N
   --include-comments    Also crawl replies for each post
-  --num-comment-crawl N Max top-level replies per post (default: all up to cap 50)
+  --num-comment-crawl N Max top-level replies per post (default: all up to cap 200)
   --get-replies         Also include nested replies under top-level replies
   --json
 
@@ -67,7 +67,10 @@ from playwright.sync_api import sync_playwright
 from .utils import (
     clean_html_to_text,
     crawled_at_now,
+    filter_rows_by_query,
     human_delay,
+    keyword_search_query,
+    overfetch_limit,
     parse_engagement_count,
     resolve_limit,
     truncate_title,
@@ -104,7 +107,7 @@ X_MIN_FAVES = ""
 X_MIN_RETWEETS = ""
 
 # Comments (YouTube-aligned knobs).
-X_COMMENTS_HARD_CAP = 50
+X_COMMENTS_HARD_CAP = 200
 X_GET_REPLIES = False
 
 SOURCE_KEY_SEARCH = "x_playwright"
@@ -931,8 +934,13 @@ class XSearchCrawler:
             return empty_crawl_result()
 
         filt = self.normalize_search_filter(search_filter)
+        # Shape NL → quoted phrases + must tokens; over-fetch then soft-filter.
+        search_q = keyword_search_query(query) or query
+        want = resolve_limit(limit, hard_cap=None)
+        fetch_n = overfetch_limit(want) if want is not None else limit
+
         url = self.build_url(
-            query,
+            search_q,
             search_filter=filt,
             since=since,
             until=until,
@@ -942,18 +950,21 @@ class XSearchCrawler:
         )
         result = self.client.crawl_feed_and_comments(
             url,
-            limit,
+            fetch_n,
             SOURCE_KEY_SEARCH,
             include_comments=include_comments,
             num_comment_crawl=num_comment_crawl,
             get_replies=get_replies,
             on_item=on_item,
         )
+        posts = filter_rows_by_query(result.get("posts") or [], query, limit=want, soft=True)
+        result = {"posts": posts, "comments": result.get("comments") or []}
         logger.info(
-            "x_playwright search posts=%d comments=%d query=%r filter=%s",
+            "x_playwright search posts=%d comments=%d query=%r shaped=%r filter=%s",
             len(result["posts"]),
             len(result["comments"]),
             query,
+            search_q,
             filt,
         )
         return result
@@ -1063,6 +1074,56 @@ def fetch(
         get_replies=get_replies,
         on_item=on_item,
     )
+
+
+def enrich_posts_with_comments(
+    posts: List[Dict],
+    *,
+    num_comment_crawl: Optional[int] = None,
+    get_replies: Optional[bool] = None,
+    on_item=None,
+) -> CrawlResult:
+    """Stream unique posts + comments (multi-mode enrich pass after discovery)."""
+    out = empty_crawl_result()
+    out["posts"] = list(posts or [])
+    if not out["posts"]:
+        return out
+
+    client = XPlaywrightClient()
+    if not client.session_configured():
+        raise SessionExpiredError(
+            "x_playwright",
+            "X_AUTH_TOKEN and X_CT0 must be set in .env",
+        )
+
+    try:
+        with sync_playwright() as playwright:
+            browser: Browser = playwright.chromium.launch(headless=X_HEADLESS)
+            context: BrowserContext = browser.new_context(
+                viewport={"width": 1280, "height": 800},
+                user_agent=DESKTOP_UA,
+            )
+            context.add_cookies(client.build_cookies())
+            page = context.new_page()
+
+            if on_item:
+                for post in out["posts"]:
+                    on_item("post", post)
+
+            out["comments"] = XCommentsCrawler(client).fetch_for_posts(
+                page,
+                out["posts"],
+                num_comment_crawl=num_comment_crawl,
+                get_replies=get_replies,
+                on_item=on_item,
+            )
+            context.close()
+            browser.close()
+    except SessionExpiredError:
+        raise
+    except Exception as exc:
+        logger.exception("x_playwright enrich failed: %s", exc)
+    return out
 
 
 def fetch_profile(

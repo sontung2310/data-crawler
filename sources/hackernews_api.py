@@ -1,13 +1,22 @@
 from typing import List, Dict, Optional
 import requests
-from .utils import UA, crawled_at_now, resolve_limit
+from .utils import (
+    UA,
+    crawled_at_now,
+    resolve_limit,
+    keyword_search_query,
+    overfetch_limit,
+    filter_rows_by_query,
+)
 
 def fetch(query: str, limit: Optional[int] = None) -> List[Dict]:
-    page_size = resolve_limit(limit, hard_cap=50) or 50
+    want = resolve_limit(limit, hard_cap=50) or 50
+    fetch_n = overfetch_limit(want, hard_cap=50) or want
+    q = keyword_search_query(query) or (query or "")
     params = {
-        "query": query or "",
+        "query": q,
         "tags": "story",
-        "hitsPerPage": page_size,
+        "hitsPerPage": fetch_n,
         "restrictSearchableAttributes": "title,url",
     }
     try:
@@ -37,4 +46,4 @@ def fetch(query: str, limit: Optional[int] = None) -> List[Dict]:
             "author": author,
             "engagement": {"points": h.get("points"), "num_comments": h.get("num_comments")},
         })
-    return out if limit is None else out[:limit]
+    return filter_rows_by_query(out, query, limit=limit if limit is not None else want, soft=True)

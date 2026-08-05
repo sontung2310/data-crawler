@@ -22,7 +22,7 @@ from urllib.parse import urlparse
 from ddgs import DDGS
 from trafilatura import extract, fetch_url
 
-from .utils import crawled_at_now, human_delay
+from .utils import crawled_at_now, human_delay, web_search_query, filter_rows_by_query, overfetch_limit
 
 logger = logging.getLogger(__name__)
 
@@ -242,19 +242,20 @@ def fetch(
     limit is both DDGS max_results and max rows returned (after social filter /
     extract failures, length may be <= limit).
     """
-    q = (query or "").strip()
+    q = web_search_query(query) or (query or "").strip()
     if not q:
         logger.warning("duckduckgo_web: empty query")
         return []
 
     lim = max(1, int(limit))
+    fetch_n = overfetch_limit(lim) or lim
     tl = (timelimit or "").strip().lower() or None
     if tl and tl not in ALLOWED_TIMELIMITS:
         logger.warning("duckduckgo_web: invalid timelimit=%r; ignoring", timelimit)
         tl = None
 
     candidates = _search_urls(
-        q, region=region or DEFAULT_REGION, timelimit=tl, max_results=lim
+        q, region=region or DEFAULT_REGION, timelimit=tl, max_results=fetch_n
     )
     out: List[Dict] = []
     for i, hit in enumerate(candidates):
@@ -268,14 +269,15 @@ def fetch(
                 extracted=extracted,
             )
         )
-        if len(out) >= lim:
-            break
         if i + 1 < len(candidates):
             human_delay(EXTRACT_DELAY_MIN, EXTRACT_DELAY_MAX)
 
+    out = filter_rows_by_query(out, query, limit=lim, soft=True)
+
     logger.info(
-        "duckduckgo_web fetched %d rows for query=%r region=%s timelimit=%s",
+        "duckduckgo_web fetched %d rows for query=%r shaped=%r region=%s timelimit=%s",
         len(out),
+        query,
         q,
         region,
         tl,

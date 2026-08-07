@@ -1,6 +1,6 @@
 # Data-Crawler-Task
 
-Local-only crawl API isolated from Pace-Unit. Accepts a query, crawls selected sources in parallel (one keyword per task), writes each post/comment to MongoDB as soon as it is scraped, and exposes task status.
+Local-only crawl API isolated from Pace-Unit. Accepts a query (HTTP or SQS), crawls selected sources in parallel (one keyword per task), writes each post/comment to MongoDB as soon as it is scraped, optionally publishes `raw_collected` events to SQS, and exposes task status.
 
 Pace-Unit is **not** modified; this project is a copy + API wrapper.
 
@@ -129,7 +129,47 @@ Requires `OPENAI_API_KEY` (model default `gpt-5.6-luna` via `EVAL_MODEL`). Crawl
 
 ## SQS
 
-Disabled until `AWS_SQS_QUEUE_URL`, `AWS_REGION`, `AWS_ACCESS_KEY_ID`, and `AWS_SECRET_ACCESS_KEY` are all set. Until then a no-op publisher is used; SQS failures never fail the crawl.
+Two optional queues. Both need `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_REGION`.
+
+| Queue | Env | Role |
+|-------|-----|------|
+| Command | `AWS_SQS_COMMAND_QUEUE_URL` | Long-poll crawl jobs → same path as `POST /crawl` |
+| Response | `AWS_SQS_QUEUE_URL` | Publish `raw_collected` after each Mongo write |
+
+Set `SQS_COMMAND_CONSUMER_ENABLED=0` to disable the consumer. Omit a queue URL to skip that side. Response publish failures become task warnings (`sqs_error`) and never fail the crawl.
+
+### Command message
+
+```json
+{
+  "query": "agentic AI marketing",
+  "source": "all",
+  "time_delta": "day",
+  "limit": 2,
+  "job_id": "optional-stable-id"
+}
+```
+
+Same fields as `POST /crawl`. `job_id` becomes `task_id` (otherwise a new UUID). Message is deleted after the task is **accepted**, not after the crawl finishes. If the same `job_id` is already in Mongo, the consumer skips starting another crawl (safe redelivery). Failed parse/accept leaves the message for visibility timeout retry / DLQ (configure redrive in AWS).
+
+### Response event
+
+```json
+{
+  "event_id": "uuid",
+  "schema_version": 1,
+  "event_type": "raw_collected",
+  "content_type": "post",
+  "source": "x_playwright",
+  "external_id": "...",
+  "parent_content_id": null,
+  "history_id": "<task_id>",
+  "occurred_at": "2026-01-01T00:00:00Z",
+  "payload": { }
+}
+```
+
+`content_type` is `post` or `comment`. One SQS message per scraped item.
 
 ## Timeouts
 

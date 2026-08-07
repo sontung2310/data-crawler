@@ -19,6 +19,7 @@ from events import (
     external_id_for_comment,
     external_id_for_post,
     post_event_from_row,
+    validate_event,
 )
 from persist import persist_raw_comments, persist_raw_posts, save_crawl_task
 from publishers import get_publisher
@@ -285,10 +286,14 @@ def _make_on_item(task: TaskState, adapter_name: str) -> Callable[[str, dict], N
                 task.bump(adapter_name, "post")
                 event = post_event_from_row(row, task.task_id)
                 if event:
-                    try:
-                        publisher.publish_post(event)
-                    except Exception as exc:
-                        task.add_warning(adapter_name, "sqs_error", str(exc))
+                    ok, reason = validate_event(event)
+                    if not ok:
+                        task.add_warning(adapter_name, "sqs_invalid_event", reason)
+                    else:
+                        try:
+                            publisher.publish_post(event)
+                        except Exception as exc:
+                            task.add_warning(adapter_name, "sqs_error", str(exc))
             elif kind == "comment":
                 row = dict(row)
                 row["query"] = task.query
@@ -322,10 +327,14 @@ def _make_on_item(task: TaskState, adapter_name: str) -> Callable[[str, dict], N
                 task.bump(adapter_name, "comment")
                 event = comment_event_from_row(row, task.task_id)
                 if event:
-                    try:
-                        publisher.publish_comment(event)
-                    except Exception as exc:
-                        task.add_warning(adapter_name, "sqs_error", str(exc))
+                    ok, reason = validate_event(event)
+                    if not ok:
+                        task.add_warning(adapter_name, "sqs_invalid_event", reason)
+                    else:
+                        try:
+                            publisher.publish_comment(event)
+                        except Exception as exc:
+                            task.add_warning(adapter_name, "sqs_error", str(exc))
         except Exception as exc:
             logger.exception("on_item failed source=%s: %s", adapter_name, exc)
             # Persist failure is a real error — do not report the crawl as completed success

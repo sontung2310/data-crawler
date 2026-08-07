@@ -19,6 +19,7 @@ from config import (
     SQS_WAIT_TIME_SECONDS,
 )
 from orchestrator import create_accepted_task, normalize_time_delta, submit_crawl
+from persist import get_crawl_task
 from sources import resolve_adapters
 
 logger = logging.getLogger(__name__)
@@ -56,9 +57,17 @@ def _parse_command(body: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def handle_command_message(body: Dict[str, Any]) -> str:
-    """Accept + submit crawl; returns task_id. Does not talk to HTTP."""
+    """Accept + submit crawl; returns task_id. Idempotent on job_id."""
     cmd = _parse_command(body)
     task_id = cmd["job_id"]
+    existing = get_crawl_task(task_id)
+    if existing:
+        logger.info(
+            "[CommandSQS] skip duplicate task_id=%s status=%s",
+            task_id,
+            existing.get("status"),
+        )
+        return task_id
     create_accepted_task(task_id, cmd["query"], cmd["source"], cmd["time_delta"], cmd["limit"])
     submit_crawl(task_id, cmd["query"], cmd["source"], cmd["time_delta"], cmd["limit"])
     logger.info(

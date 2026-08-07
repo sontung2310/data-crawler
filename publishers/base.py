@@ -1,7 +1,8 @@
 """Event publisher factory."""
 from __future__ import annotations
 
-from typing import Any, Dict, Protocol
+import threading
+from typing import Any, Dict, Optional, Protocol
 
 from config import (
     AWS_ACCESS_KEY_ID,
@@ -17,6 +18,10 @@ class EventPublisher(Protocol):
     def publish_comment(self, event: Dict[str, Any]) -> None: ...
 
 
+_publisher: Optional[EventPublisher] = None
+_lock = threading.Lock()
+
+
 def sqs_fully_configured() -> bool:
     return bool(
         AWS_SQS_QUEUE_URL
@@ -27,10 +32,25 @@ def sqs_fully_configured() -> bool:
 
 
 def get_publisher() -> EventPublisher:
-    if sqs_fully_configured():
-        from publishers.sqs import SqsPublisher
+    """Return a process-wide publisher (one boto3 client when SQS is configured)."""
+    global _publisher
+    if _publisher is not None:
+        return _publisher
+    with _lock:
+        if _publisher is None:
+            if sqs_fully_configured():
+                from publishers.sqs import SqsPublisher
 
-        return SqsPublisher()
-    from publishers.null import NullPublisher
+                _publisher = SqsPublisher()
+            else:
+                from publishers.null import NullPublisher
 
-    return NullPublisher()
+                _publisher = NullPublisher()
+        return _publisher
+
+
+def reset_publisher_for_tests() -> None:
+    """Clear cached publisher (unit tests only)."""
+    global _publisher
+    with _lock:
+        _publisher = None

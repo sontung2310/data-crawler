@@ -1,4 +1,4 @@
-"""Event envelope helpers for Kafka raw ingest."""
+"""Event envelope helpers for raw_collected (SQS / downstream ingest)."""
 from __future__ import annotations
 
 import hashlib

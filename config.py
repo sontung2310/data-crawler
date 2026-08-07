@@ -52,12 +52,20 @@ MONGODB_URI = os.environ.get("MONGODB_URI", "mongodb://localhost:27017")
 MONGODB_DBNAME = os.environ.get("MONGODB_DBNAME", "pace_database")
 MONGODB_TLS = os.environ.get("MONGODB_TLS", "").lower() in ("1", "true", "yes")
 
-# SQS (optional — NullPublisher until fully configured)
-AWS_SQS_QUEUE_URL = (os.environ.get("AWS_SQS_QUEUE_URL") or "").strip()
-AWS_REGION = (os.environ.get("AWS_REGION") or "us-east-1").strip()
+# AWS / SQS
 AWS_ACCESS_KEY_ID = (os.environ.get("AWS_ACCESS_KEY_ID") or "").strip()
 AWS_SECRET_ACCESS_KEY = (os.environ.get("AWS_SECRET_ACCESS_KEY") or "").strip()
-
+AWS_REGION = (os.environ.get("AWS_REGION") or "ap-southeast-2").strip()
+# Publish raw_collected events here (AI / response queue)
+AWS_SQS_QUEUE_URL = (os.environ.get("AWS_SQS_QUEUE_URL") or "").strip()
+# Long-poll crawl commands from Pace-Unit
+AWS_SQS_COMMAND_QUEUE_URL = (os.environ.get("AWS_SQS_COMMAND_QUEUE_URL") or "").strip()
+SQS_WAIT_TIME_SECONDS = int(os.environ.get("SQS_WAIT_TIME_SECONDS", "20"))
+SQS_COMMAND_CONSUMER_ENABLED = os.environ.get("SQS_COMMAND_CONSUMER_ENABLED", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 # Email alerts (optional)
 ALERT_EMAIL_TO = (os.environ.get("ALERT_EMAIL_TO") or "").strip()
 ALERT_EMAIL_FROM = (os.environ.get("ALERT_EMAIL_FROM") or "").strip()

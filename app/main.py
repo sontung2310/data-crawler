@@ -34,3 +34,9 @@ def _startup() -> None:
         ensure_raw_indexes()
     except Exception as exc:
         logging.getLogger(__name__).warning("Mongo index init deferred: %s", exc)
+    try:
+        from consumers.command_sqs import start_command_consumer
+
+        start_command_consumer()
+    except Exception as exc:
+        logging.getLogger(__name__).warning("SQS command consumer not started: %s", exc)

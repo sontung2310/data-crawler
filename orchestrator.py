@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
@@ -11,7 +12,6 @@ from typing import Any, Callable, Dict, List, Optional
 from config import (
     CRAWL_MAX_WORKERS,
     CRAWL_PW_REDDIT_SLOTS,
-    CRAWL_PW_X_SLOTS,
     CRAWL_TASK_TIMEOUT_SEC,
 )
 from events import (
@@ -33,10 +33,10 @@ from sources.utils import (
 
 from app.alerts import notify_session_expired
 from exceptions import SessionExpiredError
+from x_resource import x_session_slot
 
 logger = logging.getLogger(__name__)
 
-_x_slots = threading.Semaphore(max(1, CRAWL_PW_X_SLOTS))
 _reddit_slots = threading.Semaphore(max(1, CRAWL_PW_REDDIT_SLOTS))
 _executor = ThreadPoolExecutor(max_workers=max(1, CRAWL_MAX_WORKERS))
 
@@ -97,8 +97,10 @@ class TaskState:
         self.status = status
         self.posts_written = 0
         self.comments_written = 0
+        self.influencers_written = 0
         self.per_source: Dict[str, Dict[str, Any]] = {
-            s: {"status": "pending", "posts": 0, "comments": 0} for s in sources
+            s: {"status": "pending", "posts": 0, "comments": 0, "influencers": 0}
+            for s in sources
         }
         self.errors: List[Dict[str, str]] = []
         self.warnings: List[Dict[str, str]] = []
@@ -125,6 +127,7 @@ class TaskState:
             "progress": {
                 "posts_written": self.posts_written,
                 "comments_written": self.comments_written,
+                "influencers_written": self.influencers_written,
             },
             "per_source": {k: dict(v) for k, v in self.per_source.items()},
             "errors": list(self.errors),
@@ -182,12 +185,19 @@ class TaskState:
                 if name in self.per_source:
                     self.per_source[name]["posts"] += 1
                 count = self.per_source.get(name, {}).get("posts", 0)
-            else:
+            elif kind == "comment":
                 self.comments_written += 1
                 if name in self.per_source:
                     self.per_source[name]["comments"] += 1
                 count = self.per_source.get(name, {}).get("comments", 0)
-            total = self.posts_written + self.comments_written
+            elif kind == "influencer":
+                self.influencers_written += 1
+                if name in self.per_source:
+                    self.per_source[name]["influencers"] += 1
+                count = self.per_source.get(name, {}).get("influencers", 0)
+            else:
+                raise ValueError(f"unknown item kind {kind!r}")
+            total = self.posts_written + self.comments_written + self.influencers_written
             should_flush = total % 10 == 0
         logger.info(
             "task=%s source=%s new_%s total_for_source=%s posts=%s comments=%s",
@@ -211,11 +221,12 @@ class TaskState:
                 datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
             )
         logger.info(
-            "task=%s finished status=%s posts=%s comments=%s errors=%s",
+            "task=%s finished status=%s posts=%s comments=%s influencers=%s errors=%s",
             self.task_id,
             status,
             self.posts_written,
             self.comments_written,
+            self.influencers_written,
             len(self.errors),
         )
         self._flush()
@@ -498,31 +509,29 @@ def _run_one_adapter(task: TaskState, name: str, query: str, limit: int, time_fi
 
     task.set_source_status(name, "running")
     on_item = _make_on_item(task, name)
-    sem = None
-    if name == "x_playwright":
-        sem = _x_slots
-    elif name == "reddit_playwright":
-        sem = _reddit_slots
+    sem = _reddit_slots if name == "reddit_playwright" else None
+    x_slot = x_session_slot() if name == "x_playwright" else nullcontext()
 
     try:
-        if sem is not None:
-            sem.acquire()
-        try:
-            if task.cancelled():
-                task.set_source_status(name, "cancelled")
-                return
-            _call_adapter(name, query, limit, time_filter, on_item)
-            if task.cancelled():
-                task.set_source_status(name, "cancelled")
-            else:
-                with task.lock:
-                    already_failed = task.per_source.get(name, {}).get("status") == "failed"
-                if not already_failed:
-                    task.set_source_status(name, "completed")
-                    logger.info("task=%s source=%s crawl finished OK", task.task_id, name)
-        finally:
+        with x_slot:
             if sem is not None:
-                sem.release()
+                sem.acquire()
+            try:
+                if task.cancelled():
+                    task.set_source_status(name, "cancelled")
+                    return
+                _call_adapter(name, query, limit, time_filter, on_item)
+                if task.cancelled():
+                    task.set_source_status(name, "cancelled")
+                else:
+                    with task.lock:
+                        already_failed = task.per_source.get(name, {}).get("status") == "failed"
+                    if not already_failed:
+                        task.set_source_status(name, "completed")
+                        logger.info("task=%s source=%s crawl finished OK", task.task_id, name)
+            finally:
+                if sem is not None:
+                    sem.release()
     except SessionExpiredError as exc:
         notify_session_expired(exc.source or name, exc.message)
         task.add_error(name, "session_expired", exc.message)

@@ -38,3 +38,6 @@ class SqsPublisher:
 
     def publish_comment(self, event: Dict[str, Any]) -> None:
         self._send(event)
+
+    def publish_influencer(self, event: Dict[str, Any]) -> None:
+        self._send(event)

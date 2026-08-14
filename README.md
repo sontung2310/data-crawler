@@ -1,6 +1,6 @@
 # Data-Crawler-Task
 
-Local-only crawl API isolated from Pace-Unit. Accepts a query (HTTP or SQS), crawls selected sources in parallel (one keyword per task), writes each post/comment to MongoDB as soon as it is scraped, optionally publishes `raw_collected` events to SQS, and exposes task status.
+Local crawler for content and X influencer discovery. It accepts jobs over HTTP/SQS, stores posts, comments, and individual influencers in MongoDB, and optionally publishes one `raw_collected` event per item.
 
 Pace-Unit is **not** modified; this project is a copy + API wrapper.
 
@@ -99,7 +99,7 @@ Optional header `X-API-Key` if `CRAWL_API_KEY` is set in `.env`.
 | `news` | google_news, bbc, techcrunch, guardian, hackernews, newsapi, reddit_official, reddit_rss |
 | `all` | everything above |
 
-Threading: one query; adapters run in a thread pool. X and Reddit each use one browser in their own thread (can run in parallel with each other and with HTTP sources). No multi-thread inside a single Playwright session.
+Threading: content adapters run in a thread pool. Content crawling and influencer discovery share one process-wide X gate, so only one X pipeline uses the authenticated session at a time. Non-X sources can still run in parallel.
 
 ## Sessions (X / Reddit)
 
@@ -112,7 +112,7 @@ On expiry / login wall: task error `session_expired`, log line, and optional ema
 
 ## MongoDB
 
-Collections: `raw_posts`, `raw_comments`, `crawl_tasks`.
+Collections: `raw_posts`, `raw_comments`, `influencers`, `crawl_tasks`.
 
 Unique key for content: `(source, external_id)`. Each row includes `query` (crawl keyword) and may include `task_id`.
 
@@ -138,19 +138,37 @@ Two optional queues. Both need `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and
 
 Set `SQS_COMMAND_CONSUMER_ENABLED=0` to disable the consumer. Omit a queue URL to skip that side. Response publish failures become task warnings (`sqs_error`) and never fail the crawl.
 
-### Command message
+### Content crawl command
 
 ```json
 {
-  "query": "agentic AI marketing",
-  "source": "all",
-  "time_delta": "day",
-  "limit": 2,
-  "job_id": "optional-stable-id"
+  "job_id": "crawl-marketing-001",
+  "task_type": "content_crawl",
+  "input": {
+    "query": "Digital Marketing Trends",
+    "source": "all",
+    "time_delta": "week",
+    "limit": 20
+  }
 }
 ```
 
-Same fields as `POST /crawl`. `job_id` becomes `task_id` (otherwise a new UUID). Message is deleted after the task is **accepted**, not after the crawl finishes. If the same `job_id` is already in Mongo, the consumer skips starting another crawl (safe redelivery). Failed parse/accept leaves the message for visibility timeout retry / DLQ (configure redrive in AWS).
+The previous flat content message remains supported and defaults to `content_crawl`.
+
+### Influencer discovery command
+
+```json
+{
+  "job_id": "influencers-marketing-001",
+  "task_type": "influencer_discovery",
+  "input": {
+    "topic": "Marketing",
+    "limit": 10
+  }
+}
+```
+
+`job_id` becomes `task_id` (otherwise a new UUID). If the same ID already exists in Mongo, the consumer skips it.
 
 ### Response event
 
@@ -169,7 +187,27 @@ Same fields as `POST /crawl`. `job_id` becomes `task_id` (otherwise a new UUID).
 }
 ```
 
-`content_type` is `post` or `comment`. One SQS message per scraped item.
+`content_type` is `post`, `comment`, or `influencer`. One SQS message is published per item.
+
+Influencer payloads contain only the required profile fields:
+
+```json
+{
+  "content_type": "influencer",
+  "source": "x_influencer_discovery",
+  "external_id": "bruno_nwogu",
+  "history_id": "influencers-marketing-001",
+  "payload": {
+    "topic": "Marketing",
+    "name": "Bruno | Einstein of Marketing",
+    "handle": "bruno_nwogu",
+    "bio": "TEDx Speaker",
+    "profile_img_url": "https://pbs.twimg.com/profile_images/example.jpg",
+    "followers_count": 154200,
+    "following_count": 1627
+  }
+}
+```
 
 ## Timeouts
 

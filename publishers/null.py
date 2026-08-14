@@ -10,3 +10,6 @@ class NullPublisher:
 
     def publish_comment(self, event: Dict[str, Any]) -> None:
         return None
+
+    def publish_influencer(self, event: Dict[str, Any]) -> None:
+        return None

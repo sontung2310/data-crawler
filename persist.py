@@ -1,4 +1,4 @@
-"""Mongo persistence for raw_posts, raw_comments, crawl_tasks."""
+"""Mongo persistence for raw posts, comments, influencers, and crawl tasks."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -196,6 +196,40 @@ def persist_raw_comments(rows: Iterable[dict]) -> Tuple[int, int]:
             updated += 1
 
     return created, updated
+
+
+def persist_influencer(row: Dict[str, Any]) -> Tuple[int, int]:
+    """Upsert one influencer document, keyed by its normalized X handle."""
+    ensure_raw_indexes()
+    source = (row.get("source") or "").strip()
+    handle = (row.get("handle") or "").strip().lstrip("@").lower()
+    if not source or not handle:
+        return 0, 0
+
+    now = datetime.now(timezone.utc)
+    doc = {
+        "platform": "x",
+        "name": row.get("name"),
+        "handle": handle,
+        "bio": row.get("bio"),
+        "profile_img_url": row.get("profile_img_url"),
+        "followers_count": row.get("followers_count"),
+        "following_count": row.get("following_count"),
+        "updated_at": now,
+    }
+    update: Dict[str, Any] = {
+        "$set": doc,
+        "$setOnInsert": {"created_at": now},
+    }
+    topic = (row.get("topic") or "").strip()
+    if topic:
+        update["$addToSet"] = {"topics": topic}
+    res = get_mongo_db()["influencers"].update_one(
+        {"_id": f"x:{handle}"},
+        update,
+        upsert=True,
+    )
+    return (1, 0) if res.upserted_id is not None else (0, 1)
 
 
 def save_crawl_task(doc: Dict[str, Any]) -> None:

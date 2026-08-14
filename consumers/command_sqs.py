@@ -18,6 +18,10 @@ from config import (
     SQS_COMMAND_CONSUMER_ENABLED,
     SQS_WAIT_TIME_SECONDS,
 )
+from influencer_orchestrator import (
+    create_accepted_influencer_task,
+    submit_influencer_task,
+)
 from orchestrator import create_accepted_task, normalize_time_delta, submit_crawl
 from persist import get_crawl_task
 from sources import resolve_adapters
@@ -34,21 +38,46 @@ def _sqs_client():
 
 
 def _parse_command(body: Dict[str, Any]) -> Dict[str, Any]:
-    query = (body.get("query") or "").strip()
+    task_type = (body.get("task_type") or "content_crawl").strip().lower()
+    if task_type not in ("content_crawl", "influencer_discovery"):
+        raise ValueError(
+            "task_type must be content_crawl or influencer_discovery"
+        )
+    params = body.get("input", body)
+    if not isinstance(params, dict):
+        raise ValueError("input must be an object")
+
+    job_id = (body.get("job_id") or "").strip() or str(uuid.uuid4())
+    if task_type == "influencer_discovery":
+        topic = (params.get("topic") or "").strip()
+        if not topic:
+            raise ValueError("topic is required")
+        try:
+            limit = int(params.get("limit", 10))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("limit must be an integer") from exc
+        return {
+            "job_id": job_id,
+            "task_type": task_type,
+            "topic": topic,
+            "limit": max(1, min(limit, 100)),
+        }
+
+    query = (params.get("query") or "").strip()
     if not query:
         raise ValueError("query is required")
-    source = body.get("source")
-    time_delta = body.get("time_delta")
+    source = params.get("source")
+    time_delta = params.get("time_delta")
     try:
-        limit = int(body.get("limit", DEFAULT_FETCH_LIMIT))
+        limit = int(params.get("limit", DEFAULT_FETCH_LIMIT))
     except (TypeError, ValueError) as exc:
         raise ValueError("limit must be an integer") from exc
     limit = max(1, min(limit, 100))
     resolve_adapters(source)
     normalize_time_delta(time_delta)
-    job_id = (body.get("job_id") or "").strip() or str(uuid.uuid4())
     return {
         "job_id": job_id,
+        "task_type": task_type,
         "query": query,
         "source": source,
         "time_delta": time_delta,
@@ -66,6 +95,16 @@ def handle_command_message(body: Dict[str, Any]) -> str:
             "[CommandSQS] skip duplicate task_id=%s status=%s",
             task_id,
             existing.get("status"),
+        )
+        return task_id
+    if cmd["task_type"] == "influencer_discovery":
+        create_accepted_influencer_task(task_id, cmd["topic"], cmd["limit"])
+        submit_influencer_task(task_id, cmd["topic"], cmd["limit"])
+        logger.info(
+            "[CommandSQS] accepted influencer task_id=%s topic=%r limit=%s",
+            task_id,
+            cmd["topic"],
+            cmd["limit"],
         )
         return task_id
     create_accepted_task(task_id, cmd["query"], cmd["source"], cmd["time_delta"], cmd["limit"])

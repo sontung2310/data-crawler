@@ -12,6 +12,7 @@ if str(_ROOT) not in sys.path:
 
 from events import (  # noqa: E402
     comment_event_from_row,
+    influencer_event_from_row,
     post_event_from_row,
     validate_event,
 )
@@ -76,6 +77,41 @@ class TestEventFromRow(unittest.TestCase):
         assert event is not None
         self.assertEqual(event["content_type"], "comment")
         self.assertEqual(event["parent_content_id"], "p1")
+        ok, _ = validate_event(event)
+        self.assertTrue(ok)
+
+    def test_influencer_event(self) -> None:
+        event = influencer_event_from_row(
+            {
+                "source": "x_influencer_discovery",
+                "topic": "Marketing",
+                "name": "Example Person",
+                "handle": "Example_Handle",
+                "bio": "Marketing educator",
+                "profile_img_url": "https://example.com/profile.jpg",
+                "followers_count": 1200,
+                "following_count": 100,
+            },
+            "task-3",
+        )
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual(event["content_type"], "influencer")
+        self.assertEqual(event["external_id"], "example_handle")
+        self.assertNotIn("score", event["payload"])
+        self.assertNotIn("confidence", event["payload"])
+        self.assertEqual(
+            set(event["payload"]),
+            {
+                "topic",
+                "name",
+                "handle",
+                "bio",
+                "profile_img_url",
+                "followers_count",
+                "following_count",
+            },
+        )
         ok, _ = validate_event(event)
         self.assertTrue(ok)
 

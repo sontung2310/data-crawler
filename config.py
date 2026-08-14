@@ -22,7 +22,6 @@ CRAWL_API_KEY = (os.environ.get("CRAWL_API_KEY") or "").strip() or None
 
 # Crawl runtime
 CRAWL_MAX_WORKERS = int(os.environ.get("CRAWL_MAX_WORKERS", "4"))
-CRAWL_PW_X_SLOTS = int(os.environ.get("CRAWL_PW_X_SLOTS", "1"))
 CRAWL_PW_REDDIT_SLOTS = int(os.environ.get("CRAWL_PW_REDDIT_SLOTS", "1"))
 CRAWL_TASK_TIMEOUT_SEC = int(os.environ.get("CRAWL_TASK_TIMEOUT_SEC", "10800"))  # 3h
 DEFAULT_FETCH_LIMIT = int(os.environ.get("DEFAULT_FETCH_LIMIT", "50"))

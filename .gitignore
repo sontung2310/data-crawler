@@ -6,6 +6,9 @@
 credentials/
 **/credentials/
 
+# Local Hugging Face classifier model (large, machine-local files)
+models/name-classifier/
+
 # Virtual environments
 .venv/
 venv/

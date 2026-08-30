@@ -23,19 +23,47 @@ from events import (
 )
 from persist import persist_raw_comments, persist_raw_posts, save_crawl_task
 from publishers import get_publisher
-from sources import REGISTRY, resolve_adapters
-from sources.utils import (
-    filter_posts_by_time_filter,
-    normalize_time_filter,
-    time_filter_from_days,
-    time_filter_to_days,
-)
-
 from app.alerts import notify_session_expired
 from exceptions import SessionExpiredError
 from x_resource import x_session_slot
 
 logger = logging.getLogger(__name__)
+
+
+def _source_registry() -> dict:
+    """Load content adapters lazily so influencer workers stay independently importable."""
+    from sources import REGISTRY
+
+    return REGISTRY
+
+
+def _resolve_source_adapters(source):
+    from sources import resolve_adapters
+
+    return resolve_adapters(source)
+
+
+def _source_utils_call(name: str, *args, **kwargs):
+    """Load content-only helpers lazily for influencer process isolation."""
+    from sources import utils
+
+    return getattr(utils, name)(*args, **kwargs)
+
+
+def filter_posts_by_time_filter(*args, **kwargs):
+    return _source_utils_call("filter_posts_by_time_filter", *args, **kwargs)
+
+
+def normalize_time_filter(*args, **kwargs):
+    return _source_utils_call("normalize_time_filter", *args, **kwargs)
+
+
+def time_filter_from_days(*args, **kwargs):
+    return _source_utils_call("time_filter_from_days", *args, **kwargs)
+
+
+def time_filter_to_days(*args, **kwargs):
+    return _source_utils_call("time_filter_to_days", *args, **kwargs)
 
 _reddit_slots = threading.Semaphore(max(1, CRAWL_PW_REDDIT_SLOTS))
 _executor = ThreadPoolExecutor(max_workers=max(1, CRAWL_MAX_WORKERS))
@@ -98,6 +126,7 @@ class TaskState:
         self.posts_written = 0
         self.comments_written = 0
         self.influencers_written = 0
+        self.extra_progress: Dict[str, int] = {}
         self.per_source: Dict[str, Dict[str, Any]] = {
             s: {"status": "pending", "posts": 0, "comments": 0, "influencers": 0}
             for s in sources
@@ -128,6 +157,7 @@ class TaskState:
                 "posts_written": self.posts_written,
                 "comments_written": self.comments_written,
                 "influencers_written": self.influencers_written,
+                **self.extra_progress,
             },
             "per_source": {k: dict(v) for k, v in self.per_source.items()},
             "errors": list(self.errors),
@@ -155,6 +185,15 @@ class TaskState:
             if name in self.per_source:
                 self.per_source[name]["status"] = status
         logger.info("task=%s source=%s status=%s", self.task_id, name, status)
+        self._flush()
+
+    def set_status(self, status: str) -> None:
+        """Set the task-level status while retaining per-source progress."""
+        with self.lock:
+            if self._done:
+                return
+            self.status = str(status)
+        logger.info("task=%s status=%s", self.task_id, status)
         self._flush()
 
     def add_error(self, source: str, code: str, message: str) -> None:
@@ -211,6 +250,15 @@ class TaskState:
         if should_flush:
             self._flush()
 
+    def set_progress(self, **values: int) -> None:
+        """Update numeric task counters without changing content-crawl counters."""
+        with self.lock:
+            if self._done:
+                return
+            for key, value in values.items():
+                self.extra_progress[key] = max(0, int(value))
+        self._flush()
+
     def finish(self, status: str) -> None:
         with self.lock:
             if self._done:
@@ -240,7 +288,7 @@ def create_accepted_task(
     limit: int,
 ) -> List[str]:
     """Write crawl_tasks row immediately so GET works before workers start."""
-    adapters = resolve_adapters(source)
+    adapters = _resolve_source_adapters(source)
     time_filter = normalize_time_delta(time_delta)
     logger.info(
         "task=%s accepted query=%r source=%s adapters=%s limit=%s",
@@ -449,7 +497,7 @@ def _call_adapter(
     time_filter: Optional[str],
     on_item: Callable[[str, dict], None],
 ) -> None:
-    meta = REGISTRY[name]
+    meta = _source_registry()[name]
     fetch = meta["fetch"]
     days = time_filter_to_days(time_filter)
 
@@ -552,7 +600,7 @@ def run_crawl_task(
     time_delta: Any,
     limit: int,
 ) -> None:
-    adapters = resolve_adapters(source)
+    adapters = _resolve_source_adapters(source)
     time_filter = normalize_time_delta(time_delta)
     logger.info(
         "task=%s starting workers adapters=%s time_filter=%s limit=%s",

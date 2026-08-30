@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 
 
 STOPWORDS = {
-    "and", "for", "from", "into", "of", "on", "or", "the", "to", "with",
+    "and", "for", "from", "in", "into", "of", "on", "or", "the", "to", "with",
 }
 
 # Small, bidirectional groups for common abbreviations. These are supporting
@@ -80,3 +81,59 @@ def term_matches_text(term: str, text: str) -> bool:
     pattern = rf"(?<![a-z0-9]){re.escape(term.lower())}(?![a-z0-9])"
     return re.search(pattern, text.lower()) is not None
 
+
+def normalize_lexical_text(value: str) -> str:
+    """Create a stable token representation for the new lexical scorer.
+
+    Hashtags and camel-case hashtag words become ordinary words; punctuation,
+    hyphens, and slashes become separators. This deliberately does not infer
+    synonyms or extract terms.
+    """
+    value = unicodedata.normalize("NFKD", value or "")
+    value = "".join(char for char in value if not unicodedata.combining(char))
+    value = re.sub(r"#([A-Za-z0-9]+)", r"\1", value)
+    value = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", value)
+    value = re.sub(r"[^A-Za-z0-9]+", " ", value).lower()
+    return " ".join(value.split())
+
+
+def lexical_match_details(term: str, text: str) -> tuple[float, set[str]]:
+    """Return match strength and the normalized term words that matched.
+
+    Comparisons use normalized whole tokens and accept basic English plural
+    forms (``farmer``/``farmers`` and ``policy``/``policies``). A one-word term
+    remains a full 1.0 match when it is present.
+    """
+    term_tokens = normalize_lexical_text(term).split()
+    text_tokens = normalize_lexical_text(text).split()
+    if not term_tokens or not text_tokens:
+        return 0.0, set()
+
+    def same_word(left: str, right: str) -> bool:
+        if left == right:
+            return True
+        if left.endswith("y") and right == f"{left[:-1]}ies":
+            return True
+        if right.endswith("y") and left == f"{right[:-1]}ies":
+            return True
+        return right in {f"{left}s", f"{left}es"} or left in {f"{right}s", f"{right}es"}
+
+    phrase_size = len(term_tokens)
+    for index in range(len(text_tokens) - phrase_size + 1):
+        if all(same_word(term_token, text_token) for term_token, text_token in zip(term_tokens, text_tokens[index:index + phrase_size])):
+            return 1.0, set(term_tokens)
+
+    if phrase_size == 1:
+        return 0.0, set()
+    matched_tokens = {
+        term_token
+        for term_token in term_tokens
+        for text_token in text_tokens
+        if same_word(term_token, text_token)
+    }
+    return (0.5, matched_tokens) if matched_tokens else (0.0, set())
+
+
+def lexical_match_strength(term: str, text: str) -> float:
+    """Return 1.0 for a full phrase, 0.5 for one word of a phrase."""
+    return lexical_match_details(term, text)[0]

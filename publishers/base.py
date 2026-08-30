@@ -17,8 +17,6 @@ class EventPublisher(Protocol):
 
     def publish_comment(self, event: Dict[str, Any]) -> None: ...
 
-    def publish_influencer(self, event: Dict[str, Any]) -> None: ...
-
 
 _publisher: Optional[EventPublisher] = None
 _lock = threading.Lock()

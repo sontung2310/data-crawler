@@ -1,4 +1,4 @@
-"""Event envelope helpers for raw_collected (SQS / downstream ingest)."""
+"""Event envelope helpers for raw_collected crawler response events."""
 from __future__ import annotations
 
 import hashlib
@@ -12,7 +12,6 @@ SUPPORTED_SCHEMA_VERSIONS = {1}
 
 CONTENT_POST = "post"
 CONTENT_COMMENT = "comment"
-CONTENT_INFLUENCER = "influencer"
 EVENT_RAW_COLLECTED = "raw_collected"
 
 
@@ -77,10 +76,6 @@ def external_id_for_comment(row: Dict[str, Any]) -> str:
     return (row.get("comment_id") or "").strip()
 
 
-def external_id_for_influencer(row: Dict[str, Any]) -> str:
-    return (row.get("handle") or "").strip().lstrip("@").lower()
-
-
 def partition_key(source: str, external_id: str) -> str:
     return f"{(source or '').strip()}:{(external_id or '').strip()}"
 
@@ -118,8 +113,11 @@ def validate_event(event: Any) -> Tuple[bool, str]:
     version = event.get("schema_version")
     if version not in SUPPORTED_SCHEMA_VERSIONS:
         return False, f"unsupported schema_version={version!r}"
+    event_type = (event.get("event_type") or "").strip()
+    if event_type and event_type != EVENT_RAW_COLLECTED:
+        return False, f"unsupported event_type={event_type!r}"
     content_type = event.get("content_type")
-    if content_type not in (CONTENT_POST, CONTENT_COMMENT, CONTENT_INFLUENCER):
+    if content_type not in (CONTENT_POST, CONTENT_COMMENT):
         return False, f"invalid content_type={content_type!r}"
     source = (event.get("source") or "").strip()
     if not source:
@@ -161,33 +159,4 @@ def comment_event_from_row(row: Dict[str, Any], history_id: Optional[str]) -> Op
         history_id=history_id,
         payload=dict(row),
         parent_content_id=parent,
-    )
-
-
-def influencer_event_from_row(
-    row: Dict[str, Any], history_id: Optional[str]
-) -> Optional[Dict[str, Any]]:
-    source = (row.get("source") or "").strip()
-    external_id = external_id_for_influencer(row)
-    if not source or not external_id:
-        return None
-    payload = {
-        key: row.get(key)
-        for key in (
-            "topic",
-            "name",
-            "handle",
-            "bio",
-            "profile_img_url",
-            "followers_count",
-            "following_count",
-        )
-    }
-    return build_event(
-        content_type=CONTENT_INFLUENCER,
-        source=source,
-        external_id=external_id,
-        history_id=history_id,
-        payload=payload,
-        parent_content_id=None,
     )

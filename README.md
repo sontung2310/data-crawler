@@ -1,8 +1,6 @@
 # Data-Crawler-Task
 
-Local crawler for content and X influencer discovery. It accepts jobs over HTTP/SQS, stores posts, comments, and individual influencers in MongoDB, and optionally publishes one `raw_collected` event per item.
-
-Pace-Unit is **not** modified; this project is a copy + API wrapper.
+Local crawler for content and X influencer discovery. It accepts jobs over HTTP/SQS, stores posts/comments and durable influencer candidates in MongoDB, and publishes article events only. Influencer discovery, evaluation, queue processing, task state, and candidate persistence are owned by this service; dashboard export is an explicit operator command.
 
 ## Requirements
 
@@ -27,13 +25,13 @@ cp .env.example .env
 Run (always **one** uvicorn worker):
 
 ```bash
-uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
+uvicorn app.main:app --host 127.0.0.1 --port 8001 --workers 1
 ```
 
 Smoke check:
 
 ```bash
-curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8001/health
 ```
 
 ## Workflow overview
@@ -41,30 +39,34 @@ curl http://127.0.0.1:8000/health
 ```mermaid
 flowchart TD
     A[Command SQS message] --> B{task_type}
-    B -->|influencer_discovery| C[Find and rank X profiles]
-    C --> C1[(MongoDB influencers)]
-    C --> C2[Response event: content_type=influencer]
+    B -->|influencer_discovery| C[Normalize TopicBrief]
+    C --> C1[X post discovery + public discovery]
+    C1 --> C2[Shared durable profile queue]
+    C2 --> C3[Evaluate + rank]
+    C3 --> C4[(MongoDB influencer_candidates)]
+    C3 --> C5[(MongoDB evidence ledger)]
+    C4 --> C6[Explicit dashboard export]
     B -->|content_crawl or omitted| D[Fetch posts/articles and comments]
     D --> D1[(MongoDB raw_posts and raw_comments)]
-    D --> D2[Response events: content_type=post/comment]
+    D --> D2[raw_collected events: post/comment]
     C --> T[(MongoDB crawl_tasks)]
     D --> T
 ```
 
 The incoming command is classified by `task_type`:
 
-- `influencer_discovery` requires `input.topic` and uses the X influencer pipeline.
+- `influencer_discovery` requires `company_id`, `company_name`, `company_domain`, `company_summary`, `field`, `related_terms`, `platform`, and `limit`.
 - `content_crawl` requires `input.query` and uses the article/content adapters.
 - If `task_type` is omitted, the message defaults to `content_crawl`.
 
-The response queue uses a different field, `content_type`, to identify each emitted item: `influencer`, `post`, or `comment`.
+The response queue carries article events only. Influencer results are read from `influencer_candidates` and are never sent through the response queue.
 
 ## Docker
 
 ```bash
 docker build -t data-crawler-task .
 # Mongo on the host (Mac/Windows):
-docker run --rm -p 8000:8000 --shm-size=1gb \
+docker run --rm -p 8001:8000 --shm-size=1gb \
   -e MONGODB_URI=mongodb://host.docker.internal:27017 \
   --env-file .env data-crawler-task
 ```
@@ -114,26 +116,27 @@ Content adapters run in a thread pool. Content crawling and influencer discovery
 
 ## Sessions (X / Reddit)
 
-Set in `.env`:
+Set in `.env` when an authenticated X session is available:
 
 - `X_AUTH_TOKEN`, `X_CT0` from x.com cookies after login
+- Or `X_BROWSER_SESSION` / `X_SESSION` as a raw cookie header or Playwright storage-state path
 - `REDDIT_SESSION` (optional `REDDIT_TOKEN_V2`) from reddit.com cookies
 
-On expiry or a login wall, the task records `session_expired`, logs the error, and optionally sends an email if SMTP variables are configured.
+Without an authenticated session, the reference X Latest lane is marked degraded and the public-search lane can still run. If an authenticated session expires or hits a login wall during fetching, the task records `session_expired`, logs the error, and optionally sends an email if SMTP variables are configured.
 
 ## Influencer classification model
 
 Influencer discovery uses a local name classifier to filter company or non-person accounts before ranking. It maps model labels such as `residential` to `person_name`, and `non_residential` or `rental` to `company_name`.
 
-The loader expects a Hugging Face-compatible model directory at `models/name-classifier` by default. The directory must contain the tokenizer/model files required by `transformers`, and it is intentionally excluded from Git because model files can be large. To use another location, set `LOCAL_CLASSIFIER_MODEL` in `.env`. Set `CLASSIFICATION_BACKEND=none` to disable classification.
+The loader expects a Hugging Face-compatible model directory at `models/name-classifier` by default. The directory must contain the tokenizer/model files required by `transformers`, and it is intentionally excluded from Git because model files can be large. To use another location, set `LOCAL_CLASSIFIER_MODEL` in `.env`. `CLASSIFICATION_BACKEND` supports `local` or `openai`; the durable workflow always applies an account-type eligibility check.
 
 If enabling the local backend, install its runtime dependencies in the virtual environment: `pip install torch transformers sentencepiece`.
 
 ## MongoDB
 
-Collections: `raw_posts`, `raw_comments`, `influencers`, `crawl_tasks`.
+Collections: `raw_posts`, `raw_comments`, `crawl_tasks`, `influencer_candidates`, and `influencer_candidate_evidence`.
 
-Content uses `(source, external_id)` as its unique key. Each row includes the query and may include the task ID. Influencers are upserted by normalized X handle.
+Content uses `(source, external_id)` as its unique key. Each row includes the query and may include the task ID. Influencer candidates are keyed by `company_id + platform + account.account_id`, with a freshness window and a run-scoped evidence ledger keyed by `task_id + company_id + platform + account_id`. The legacy `influencers` and `x_influencer_runs` collections remain untouched for rollback/reference only.
 
 X uses multi-mode search (`top` + `live`); Reddit query search is **relevance-only**. Both dedupe by post ID before comment crawling. X skips low-discussion posts on `live` (`min_replies >= 10`). The default X/Reddit comment hard cap is 200.
 
@@ -153,7 +156,7 @@ Two optional queues are supported. Both need `AWS_ACCESS_KEY_ID`, `AWS_SECRET_AC
 | Queue | Environment variable | Role |
 |-------|----------------------|------|
 | Command | `AWS_SQS_COMMAND_QUEUE_URL` | Long-poll crawl jobs; same path as `POST /crawl` |
-| Response | `AWS_SQS_QUEUE_URL` | Publish `raw_collected` after each MongoDB write |
+| Response | `AWS_SQS_QUEUE_URL` | Publish article items only |
 
 Set `SQS_COMMAND_CONSUMER_ENABLED=0` to disable the command consumer. Omit a queue URL to skip that side. Response-publish failures become `sqs_error` warnings and do not fail the crawl.
 
@@ -181,7 +184,13 @@ The previous flat content message remains supported and defaults to `content_cra
   "job_id": "influencers-marketing-001",
   "task_type": "influencer_discovery",
   "input": {
-    "topic": "Marketing",
+    "company_id": "company-123",
+    "company_name": "Marketing Eye",
+    "company_domain": "marketingeye.com.au",
+    "company_summary": "A marketing agency helping brands grow.",
+    "field": "Marketing",
+    "related_terms": ["SEO", "content marketing"],
+    "platform": "x",
     "limit": 10
   }
 }
@@ -189,32 +198,47 @@ The previous flat content message remains supported and defaults to `content_cra
 
 `job_id` becomes `task_id` (otherwise a UUID is generated). If the same ID already exists in MongoDB, the consumer skips it.
 
-### Response event
+`field` is included as the first discovery lane together with `related_terms`. X author and scroll limits remain configuration-driven through `X_AUTHORS_PER_QUERY` and `X_MAX_SCROLLS_PER_QUERY`; the current X query retains `min_faves:200`.
 
-One response message is published per item. The event identifies the item with `content_type`: `post`, `comment`, or `influencer`.
+### Dashboard export
+
+Export is intentionally separate from discovery and can be dry-run first:
+
+```bash
+python -m x_influencer_discovery export \
+  --company-id company-123 \
+  --company-domain marketingeye.com.au \
+  --platform x \
+  --limit 10 \
+  --output /tmp/influencer-export.json \
+  --dry-run
+```
+
+The export reads fresh candidates using `LEADERBOARD_MAX_AGE_DAYS`, preserves existing dashboard contact/relevancy flags, refuses an empty result, and writes directly to the dashboard MongoDB only when `--dry-run` is omitted.
+
+### Article response event
+
+One response message is published per post or comment. The event identifies the item with `content_type`: `post` or `comment`.
 
 ```json
 {
   "event_id": "uuid",
   "schema_version": 1,
   "event_type": "raw_collected",
-  "content_type": "influencer",
-  "source": "x_influencer_discovery",
-  "external_id": "example_handle",
+  "content_type": "post",
+  "source": "newsapi",
+  "external_id": "article-id",
   "parent_content_id": null,
-  "history_id": "influencers-marketing-001",
+  "history_id": "crawl-marketing-001",
   "occurred_at": "2026-01-01T00:00:00Z",
   "payload": {
-    "topic": "Marketing",
-    "name": "Example Person",
-    "handle": "example_handle",
-    "bio": "Marketing educator",
-    "profile_img_url": "https://example.com/profile.jpg",
-    "followers_count": 1200,
-    "following_count": 100
+    "title": "Example article",
+    "text": "Article body"
   }
 }
 ```
+
+There is no influencer response event. Poll `GET /crawl/{task_id}` for the authoritative DCT status, then run the explicit export command after a successful task.
 
 ## Tests
 

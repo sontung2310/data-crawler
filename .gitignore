@@ -33,6 +33,7 @@ htmlcov/
 .tox/
 .nox/
 eval_reports/
+CRAWL_TASK_REPORT.md
 
 # IDE / OS
 .idea/

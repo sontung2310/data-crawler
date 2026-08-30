@@ -22,6 +22,7 @@ class TestValidateEvent(unittest.TestCase):
         ok, reason = validate_event(
             {
                 "schema_version": 1,
+                "event_type": "raw_collected",
                 "content_type": "post",
                 "source": "x_playwright",
                 "external_id": "abc",
@@ -35,6 +36,7 @@ class TestValidateEvent(unittest.TestCase):
         ok, reason = validate_event(
             {
                 "schema_version": 1,
+                "event_type": "raw_collected",
                 "content_type": "post",
                 "source": "",
                 "external_id": "abc",
@@ -78,6 +80,11 @@ class TestEventFromRow(unittest.TestCase):
         self.assertEqual(event["parent_content_id"], "p1")
         ok, _ = validate_event(event)
         self.assertTrue(ok)
+
+    def test_influencer_response_event_is_rejected(self) -> None:
+        ok, reason = validate_event({"schema_version": 1, "event_type": "influencer_list_collected"})
+        self.assertFalse(ok)
+        self.assertIn("unsupported", reason)
 
 
 if __name__ == "__main__":

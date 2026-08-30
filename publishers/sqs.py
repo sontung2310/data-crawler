@@ -15,6 +15,7 @@ from config import (
 )
 
 logger = logging.getLogger(__name__)
+MAX_MESSAGE_BYTES = 900 * 1024
 
 
 class SqsPublisher:
@@ -28,9 +29,13 @@ class SqsPublisher:
         self._queue_url = AWS_SQS_QUEUE_URL
 
     def _send(self, event: Dict[str, Any]) -> None:
+        body = json.dumps(event, default=str)
+        size = len(body.encode("utf-8"))
+        if size > MAX_MESSAGE_BYTES:
+            raise ValueError(f"SQS event is too large: {size} bytes")
         self._client.send_message(
             QueueUrl=self._queue_url,
-            MessageBody=json.dumps(event, default=str),
+            MessageBody=body,
         )
 
     def publish_post(self, event: Dict[str, Any]) -> None:

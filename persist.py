@@ -1,6 +1,7 @@
-"""Mongo persistence for raw_posts, raw_comments, crawl_tasks."""
+"""Mongo persistence for crawl data, influencer work, and task state."""
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, Optional, Tuple
 
@@ -59,6 +60,11 @@ def ensure_raw_indexes() -> None:
         name="idx_parent_content",
     )
     db["crawl_tasks"].create_index("task_id", unique=True, name="uniq_task_id")
+    db["influencer_candidate_evidence"].create_index(
+        [("task_id", 1), ("company_id", 1), ("platform", 1), ("account_id", 1)],
+        unique=True,
+        name="uniq_influencer_candidate_evidence",
+    )
     _RAW_INDEXES_READY = True
 
 
@@ -196,6 +202,126 @@ def persist_raw_comments(rows: Iterable[dict]) -> Tuple[int, int]:
             updated += 1
 
     return created, updated
+
+
+def persist_influencer(row: Dict[str, Any]) -> Tuple[int, int]:
+    """Upsert one influencer document, keyed by its normalized X handle."""
+    ensure_raw_indexes()
+    source = (row.get("source") or "").strip()
+    handle = (row.get("handle") or "").strip().lstrip("@").lower()
+    if not source or not handle:
+        return 0, 0
+
+    now = datetime.now(timezone.utc)
+    doc = {
+        "platform": "x",
+        "name": row.get("name"),
+        "handle": handle,
+        "bio": row.get("bio"),
+        "profile_img_url": row.get("profile_img_url"),
+        "followers_count": row.get("followers_count"),
+        "following_count": row.get("following_count"),
+        "updated_at": now,
+    }
+    update: Dict[str, Any] = {
+        "$set": doc,
+        "$setOnInsert": {"created_at": now},
+    }
+    topic = (row.get("topic") or "").strip()
+    if topic:
+        update["$addToSet"] = {"topics": topic}
+    res = get_mongo_db()["influencers"].update_one(
+        {"_id": f"x:{handle}"},
+        update,
+        upsert=True,
+    )
+    return (1, 0) if res.upserted_id is not None else (0, 1)
+
+
+def save_influencer_run(
+    task_id: str,
+    company_domain_id: str,
+    output: Dict[str, Any],
+) -> None:
+    """Store the final ranked influencer output and diagnostics for one SQS task."""
+    ensure_raw_indexes()
+    now = datetime.now(timezone.utc)
+    get_mongo_db()["x_influencer_runs"].update_one(
+        {"task_id": task_id},
+        {
+            "$set": {
+                "task_id": task_id,
+                "company_domain_id": company_domain_id.strip().lower(),
+                "query": output.get("query"),
+                "platform": output.get("platform"),
+                "generated_at": output.get("generated_at"),
+                "results": deepcopy(output.get("results") or []),
+                "diagnostics": deepcopy(output.get("diagnostics") or {}),
+                "updated_at": now,
+            },
+            "$setOnInsert": {"created_at": now},
+        },
+        upsert=True,
+    )
+
+
+def upsert_influencer_candidate_evidence(
+    *,
+    task_id: str,
+    company_id: str,
+    platform: str,
+    account_id: str,
+    handle: str | None,
+    evidence: Iterable[dict[str, Any]],
+) -> None:
+    """Persist discovery evidence before profile work enters the durable queue."""
+    ensure_raw_indexes()
+    evidence_rows = [deepcopy(dict(item)) for item in evidence if isinstance(item, dict)]
+    if not evidence_rows:
+        return
+    now = datetime.now(timezone.utc)
+    get_mongo_db()["influencer_candidate_evidence"].update_one(
+        {
+            "task_id": str(task_id),
+            "company_id": str(company_id),
+            "platform": str(platform),
+            "account_id": str(account_id),
+        },
+        {
+            "$set": {
+                "task_id": str(task_id),
+                "company_id": str(company_id),
+                "platform": str(platform),
+                "account_id": str(account_id),
+                "handle": handle,
+                "updated_at": now,
+            },
+            "$addToSet": {"evidence": {"$each": evidence_rows}},
+            "$setOnInsert": {"created_at": now},
+        },
+        upsert=True,
+    )
+
+
+def get_influencer_candidate_evidence(
+    *,
+    task_id: str,
+    company_id: str,
+    platform: str,
+    account_id: str,
+) -> list[dict[str, Any]]:
+    """Read the durable evidence accumulated for one queued account."""
+    ensure_raw_indexes()
+    document = get_mongo_db()["influencer_candidate_evidence"].find_one(
+        {
+            "task_id": str(task_id),
+            "company_id": str(company_id),
+            "platform": str(platform),
+            "account_id": str(account_id),
+        },
+        {"_id": 0, "evidence": 1},
+    )
+    return list(document.get("evidence") or []) if isinstance(document, dict) else []
 
 
 def save_crawl_task(doc: Dict[str, Any]) -> None:

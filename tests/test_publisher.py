@@ -58,7 +58,9 @@ class TestSqsPublisherSend(unittest.TestCase):
             from publishers.sqs import SqsPublisher
 
             pub = SqsPublisher()
-            pub.publish_post({"event_id": "1", "event_type": "raw_collected"})
+            pub.publish_post(
+                {"event_id": "1", "event_type": "raw_collected"}
+            )
             client.send_message.assert_called_once()
             kwargs = client.send_message.call_args.kwargs
             self.assertEqual(kwargs["QueueUrl"], "https://sqs.example/q")

@@ -1,4 +1,4 @@
-"""Event envelope helpers for raw_collected (SQS / downstream ingest)."""
+"""Event envelope helpers for raw_collected crawler response events."""
 from __future__ import annotations
 
 import hashlib
@@ -113,6 +113,9 @@ def validate_event(event: Any) -> Tuple[bool, str]:
     version = event.get("schema_version")
     if version not in SUPPORTED_SCHEMA_VERSIONS:
         return False, f"unsupported schema_version={version!r}"
+    event_type = (event.get("event_type") or "").strip()
+    if event_type and event_type != EVENT_RAW_COLLECTED:
+        return False, f"unsupported event_type={event_type!r}"
     content_type = event.get("content_type")
     if content_type not in (CONTENT_POST, CONTENT_COMMENT):
         return False, f"invalid content_type={content_type!r}"

@@ -3,11 +3,10 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import uuid
 from typing import Any, Dict, Optional
-
-import boto3
 
 from config import (
     AWS_ACCESS_KEY_ID,
@@ -18,14 +17,71 @@ from config import (
     SQS_COMMAND_CONSUMER_ENABLED,
     SQS_WAIT_TIME_SECONDS,
 )
-from orchestrator import create_accepted_task, normalize_time_delta, submit_crawl
-from persist import get_crawl_task
-from sources import resolve_adapters
-
 logger = logging.getLogger(__name__)
 
 
+def resolve_adapters(source):
+    from sources import resolve_adapters as resolve
+
+    return resolve(source)
+
+
+def normalize_time_delta(value):
+    from orchestrator import normalize_time_delta as normalize
+
+    return normalize(value)
+
+
+def get_crawl_task(task_id):
+    from persist import get_crawl_task as get_task
+
+    return get_task(task_id)
+
+
+def create_accepted_task(*args):
+    from orchestrator import create_accepted_task as create
+
+    return create(*args)
+
+
+def submit_crawl(*args):
+    from orchestrator import submit_crawl as submit
+
+    return submit(*args)
+
+
+def create_accepted_influencer_task(*args, **kwargs):
+    from influencer_orchestrator import create_accepted_influencer_task as create
+
+    return create(*args, **kwargs)
+
+
+def submit_influencer_task(*args, **kwargs):
+    from influencer_orchestrator import submit_influencer_task as submit
+
+    return submit(*args, **kwargs)
+
+
+def _influencer_request(cmd: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        key: cmd[key]
+        for key in (
+            "company_id",
+            "company_name",
+            "company_domain",
+            "company_summary",
+            "field",
+            "related_terms",
+            "platform",
+            "limit",
+            "resume",
+        )
+    }
+
+
 def _sqs_client():
+    import boto3
+
     kwargs = {"region_name": AWS_REGION}
     if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
         kwargs["aws_access_key_id"] = AWS_ACCESS_KEY_ID
@@ -34,21 +90,89 @@ def _sqs_client():
 
 
 def _parse_command(body: Dict[str, Any]) -> Dict[str, Any]:
-    query = (body.get("query") or "").strip()
+    task_type = (body.get("task_type") or "content_crawl").strip().lower()
+    if task_type not in ("content_crawl", "influencer_discovery"):
+        raise ValueError(
+            "task_type must be content_crawl or influencer_discovery"
+        )
+    params = body.get("input", body)
+    if not isinstance(params, dict):
+        raise ValueError("input must be an object")
+
+    job_id = (body.get("job_id") or "").strip() or str(uuid.uuid4())
+    if task_type == "influencer_discovery":
+        required = (
+            "company_id",
+            "company_name",
+            "company_domain",
+            "company_summary",
+            "field",
+            "related_terms",
+            "platform",
+            "limit",
+        )
+        missing = [name for name in required if name not in params]
+        if missing:
+            raise ValueError(f"influencer request missing required fields: {', '.join(missing)}")
+        company_id = str(params.get("company_id") or "").strip()
+        company_name = " ".join(str(params.get("company_name") or "").split())
+        company_domain = str(params.get("company_domain") or "").strip().lower()
+        company_summary = " ".join(str(params.get("company_summary") or "").split())
+        field = " ".join(str(params.get("field") or "").split())
+        platform = str(params.get("platform") or "").strip().lower()
+        related_terms = params.get("related_terms")
+        if not company_id:
+            raise ValueError("company_id is required")
+        if not company_name:
+            raise ValueError("company_name is required")
+        if not re.fullmatch(r"[a-z0-9.-]+", company_domain):
+            raise ValueError("company_domain must be a valid domain")
+        if not company_summary:
+            raise ValueError("company_summary is required")
+        if not field:
+            raise ValueError("field is required")
+        if not isinstance(related_terms, list) or not related_terms:
+            raise ValueError("related_terms must be a non-empty array")
+        related_terms = [" ".join(str(term).split()) for term in related_terms if str(term).strip()]
+        if not related_terms:
+            raise ValueError("related_terms must contain at least one non-empty term")
+        if platform != "x":
+            raise ValueError("only platform x is currently implemented")
+        try:
+            limit = int(params["limit"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("limit must be an integer") from exc
+        if limit < 1 or limit > 100:
+            raise ValueError("limit must be between 1 and 100")
+        return {
+            "job_id": job_id,
+            "task_type": task_type,
+            "company_id": company_id,
+            "company_name": company_name,
+            "company_domain": company_domain,
+            "company_summary": company_summary,
+            "field": field,
+            "related_terms": related_terms,
+            "platform": platform,
+            "limit": max(1, min(limit, 100)),
+            "resume": bool(params.get("resume", False)),
+        }
+
+    query = (params.get("query") or "").strip()
     if not query:
         raise ValueError("query is required")
-    source = body.get("source")
-    time_delta = body.get("time_delta")
+    source = params.get("source")
+    time_delta = params.get("time_delta")
     try:
-        limit = int(body.get("limit", DEFAULT_FETCH_LIMIT))
+        limit = int(params.get("limit", DEFAULT_FETCH_LIMIT))
     except (TypeError, ValueError) as exc:
         raise ValueError("limit must be an integer") from exc
     limit = max(1, min(limit, 100))
     resolve_adapters(source)
     normalize_time_delta(time_delta)
-    job_id = (body.get("job_id") or "").strip() or str(uuid.uuid4())
     return {
         "job_id": job_id,
+        "task_type": task_type,
         "query": query,
         "source": source,
         "time_delta": time_delta,
@@ -62,10 +186,51 @@ def handle_command_message(body: Dict[str, Any]) -> str:
     task_id = cmd["job_id"]
     existing = get_crawl_task(task_id)
     if existing:
+        if (
+            cmd["task_type"] == "influencer_discovery"
+            and cmd.get("resume")
+            and existing.get("status") in {
+                "failed",
+                "stopped_x_rate_limit",
+                "stopped_x_access_errors",
+            }
+        ):
+            submit_influencer_task(task_id, **_influencer_request(cmd))
+            logger.info(
+                "event=influencer.resume_submitted task_id=%s run_id=%s company_id=%s platform=%s "
+                "step=resume status=submitted previous_status=%s",
+                task_id,
+                task_id,
+                cmd["company_id"],
+                cmd["platform"],
+                existing.get("status"),
+            )
+            return task_id
         logger.info(
             "[CommandSQS] skip duplicate task_id=%s status=%s",
             task_id,
             existing.get("status"),
+        )
+        return task_id
+    if cmd["task_type"] == "influencer_discovery":
+        request = _influencer_request(cmd)
+        create_accepted_influencer_task(task_id, **request)
+        submit_influencer_task(task_id, **request)
+        logger.info(
+            "event=influencer.command_accepted task_id=%s run_id=%s company_id=%s platform=%s "
+            "step=command_accept status=accepted field=%r limit=%s",
+            task_id,
+            task_id,
+            cmd["company_id"],
+            cmd["platform"],
+            cmd["field"],
+            cmd["limit"],
+        )
+        logger.debug(
+            "influencer command terms task_id=%s company_id=%s terms=%s",
+            task_id,
+            cmd["company_id"],
+            len(cmd["related_terms"]),
         )
         return task_id
     create_accepted_task(task_id, cmd["query"], cmd["source"], cmd["time_delta"], cmd["limit"])

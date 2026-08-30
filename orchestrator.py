@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
@@ -11,7 +12,6 @@ from typing import Any, Callable, Dict, List, Optional
 from config import (
     CRAWL_MAX_WORKERS,
     CRAWL_PW_REDDIT_SLOTS,
-    CRAWL_PW_X_SLOTS,
     CRAWL_TASK_TIMEOUT_SEC,
 )
 from events import (
@@ -23,20 +23,48 @@ from events import (
 )
 from persist import persist_raw_comments, persist_raw_posts, save_crawl_task
 from publishers import get_publisher
-from sources import REGISTRY, resolve_adapters
-from sources.utils import (
-    filter_posts_by_time_filter,
-    normalize_time_filter,
-    time_filter_from_days,
-    time_filter_to_days,
-)
-
 from app.alerts import notify_session_expired
 from exceptions import SessionExpiredError
+from x_resource import x_session_slot
 
 logger = logging.getLogger(__name__)
 
-_x_slots = threading.Semaphore(max(1, CRAWL_PW_X_SLOTS))
+
+def _source_registry() -> dict:
+    """Load content adapters lazily so influencer workers stay independently importable."""
+    from sources import REGISTRY
+
+    return REGISTRY
+
+
+def _resolve_source_adapters(source):
+    from sources import resolve_adapters
+
+    return resolve_adapters(source)
+
+
+def _source_utils_call(name: str, *args, **kwargs):
+    """Load content-only helpers lazily for influencer process isolation."""
+    from sources import utils
+
+    return getattr(utils, name)(*args, **kwargs)
+
+
+def filter_posts_by_time_filter(*args, **kwargs):
+    return _source_utils_call("filter_posts_by_time_filter", *args, **kwargs)
+
+
+def normalize_time_filter(*args, **kwargs):
+    return _source_utils_call("normalize_time_filter", *args, **kwargs)
+
+
+def time_filter_from_days(*args, **kwargs):
+    return _source_utils_call("time_filter_from_days", *args, **kwargs)
+
+
+def time_filter_to_days(*args, **kwargs):
+    return _source_utils_call("time_filter_to_days", *args, **kwargs)
+
 _reddit_slots = threading.Semaphore(max(1, CRAWL_PW_REDDIT_SLOTS))
 _executor = ThreadPoolExecutor(max_workers=max(1, CRAWL_MAX_WORKERS))
 
@@ -97,8 +125,11 @@ class TaskState:
         self.status = status
         self.posts_written = 0
         self.comments_written = 0
+        self.influencers_written = 0
+        self.extra_progress: Dict[str, int] = {}
         self.per_source: Dict[str, Dict[str, Any]] = {
-            s: {"status": "pending", "posts": 0, "comments": 0} for s in sources
+            s: {"status": "pending", "posts": 0, "comments": 0, "influencers": 0}
+            for s in sources
         }
         self.errors: List[Dict[str, str]] = []
         self.warnings: List[Dict[str, str]] = []
@@ -125,6 +156,8 @@ class TaskState:
             "progress": {
                 "posts_written": self.posts_written,
                 "comments_written": self.comments_written,
+                "influencers_written": self.influencers_written,
+                **self.extra_progress,
             },
             "per_source": {k: dict(v) for k, v in self.per_source.items()},
             "errors": list(self.errors),
@@ -152,6 +185,15 @@ class TaskState:
             if name in self.per_source:
                 self.per_source[name]["status"] = status
         logger.info("task=%s source=%s status=%s", self.task_id, name, status)
+        self._flush()
+
+    def set_status(self, status: str) -> None:
+        """Set the task-level status while retaining per-source progress."""
+        with self.lock:
+            if self._done:
+                return
+            self.status = str(status)
+        logger.info("task=%s status=%s", self.task_id, status)
         self._flush()
 
     def add_error(self, source: str, code: str, message: str) -> None:
@@ -182,12 +224,19 @@ class TaskState:
                 if name in self.per_source:
                     self.per_source[name]["posts"] += 1
                 count = self.per_source.get(name, {}).get("posts", 0)
-            else:
+            elif kind == "comment":
                 self.comments_written += 1
                 if name in self.per_source:
                     self.per_source[name]["comments"] += 1
                 count = self.per_source.get(name, {}).get("comments", 0)
-            total = self.posts_written + self.comments_written
+            elif kind == "influencer":
+                self.influencers_written += 1
+                if name in self.per_source:
+                    self.per_source[name]["influencers"] += 1
+                count = self.per_source.get(name, {}).get("influencers", 0)
+            else:
+                raise ValueError(f"unknown item kind {kind!r}")
+            total = self.posts_written + self.comments_written + self.influencers_written
             should_flush = total % 10 == 0
         logger.info(
             "task=%s source=%s new_%s total_for_source=%s posts=%s comments=%s",
@@ -201,6 +250,15 @@ class TaskState:
         if should_flush:
             self._flush()
 
+    def set_progress(self, **values: int) -> None:
+        """Update numeric task counters without changing content-crawl counters."""
+        with self.lock:
+            if self._done:
+                return
+            for key, value in values.items():
+                self.extra_progress[key] = max(0, int(value))
+        self._flush()
+
     def finish(self, status: str) -> None:
         with self.lock:
             if self._done:
@@ -211,11 +269,12 @@ class TaskState:
                 datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
             )
         logger.info(
-            "task=%s finished status=%s posts=%s comments=%s errors=%s",
+            "task=%s finished status=%s posts=%s comments=%s influencers=%s errors=%s",
             self.task_id,
             status,
             self.posts_written,
             self.comments_written,
+            self.influencers_written,
             len(self.errors),
         )
         self._flush()
@@ -229,7 +288,7 @@ def create_accepted_task(
     limit: int,
 ) -> List[str]:
     """Write crawl_tasks row immediately so GET works before workers start."""
-    adapters = resolve_adapters(source)
+    adapters = _resolve_source_adapters(source)
     time_filter = normalize_time_delta(time_delta)
     logger.info(
         "task=%s accepted query=%r source=%s adapters=%s limit=%s",
@@ -438,7 +497,7 @@ def _call_adapter(
     time_filter: Optional[str],
     on_item: Callable[[str, dict], None],
 ) -> None:
-    meta = REGISTRY[name]
+    meta = _source_registry()[name]
     fetch = meta["fetch"]
     days = time_filter_to_days(time_filter)
 
@@ -498,31 +557,29 @@ def _run_one_adapter(task: TaskState, name: str, query: str, limit: int, time_fi
 
     task.set_source_status(name, "running")
     on_item = _make_on_item(task, name)
-    sem = None
-    if name == "x_playwright":
-        sem = _x_slots
-    elif name == "reddit_playwright":
-        sem = _reddit_slots
+    sem = _reddit_slots if name == "reddit_playwright" else None
+    x_slot = x_session_slot() if name == "x_playwright" else nullcontext()
 
     try:
-        if sem is not None:
-            sem.acquire()
-        try:
-            if task.cancelled():
-                task.set_source_status(name, "cancelled")
-                return
-            _call_adapter(name, query, limit, time_filter, on_item)
-            if task.cancelled():
-                task.set_source_status(name, "cancelled")
-            else:
-                with task.lock:
-                    already_failed = task.per_source.get(name, {}).get("status") == "failed"
-                if not already_failed:
-                    task.set_source_status(name, "completed")
-                    logger.info("task=%s source=%s crawl finished OK", task.task_id, name)
-        finally:
+        with x_slot:
             if sem is not None:
-                sem.release()
+                sem.acquire()
+            try:
+                if task.cancelled():
+                    task.set_source_status(name, "cancelled")
+                    return
+                _call_adapter(name, query, limit, time_filter, on_item)
+                if task.cancelled():
+                    task.set_source_status(name, "cancelled")
+                else:
+                    with task.lock:
+                        already_failed = task.per_source.get(name, {}).get("status") == "failed"
+                    if not already_failed:
+                        task.set_source_status(name, "completed")
+                        logger.info("task=%s source=%s crawl finished OK", task.task_id, name)
+            finally:
+                if sem is not None:
+                    sem.release()
     except SessionExpiredError as exc:
         notify_session_expired(exc.source or name, exc.message)
         task.add_error(name, "session_expired", exc.message)
@@ -543,7 +600,7 @@ def run_crawl_task(
     time_delta: Any,
     limit: int,
 ) -> None:
-    adapters = resolve_adapters(source)
+    adapters = _resolve_source_adapters(source)
     time_filter = normalize_time_delta(time_delta)
     logger.info(
         "task=%s starting workers adapters=%s time_filter=%s limit=%s",

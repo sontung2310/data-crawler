@@ -387,7 +387,7 @@ def enqueue_public_candidates(
     on_discovered: Callable[[str], None] | None = None,
     on_evidence: Callable[[str, CandidateEvidence], None] | None = None,
 ) -> int:
-    """Submit public profiles and retain each independent sighting for scoring."""
+    """Submit public profiles discovered during this run."""
     sent = 0
     for candidate in candidates.values():
         url = normalize_profile_url(f"https://x.com/{candidate.handle}")
@@ -396,21 +396,10 @@ def enqueue_public_candidates(
         if on_evidence is not None:
             for evidence in candidate.evidence:
                 on_evidence(url, evidence)
-        # ``send`` intentionally collapses repeated URLs into one FIFO message
-        # while incrementing the producer's run-local appearance count.  Public
-        # discovery has already deduplicated repeated evidence from one article,
-        # so every remaining evidence item is an independent current-run
-        # sighting, consistent with the X-post producer.
-        sightings = max(1, len(candidate.evidence))
         try:
             sent += int(queue.send(url, company_id=company_id, platform=platform, handle=candidate.handle))
         except TypeError:
             sent += int(queue.send(url))
-        for _ in range(sightings - 1):
-            try:
-                queue.send(url, company_id=company_id, platform=platform, handle=candidate.handle)
-            except TypeError:
-                queue.send(url)
     return sent
 
 

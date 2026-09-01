@@ -191,7 +191,6 @@ class DurableProfileQueue:
         self.visibility_timeout_seconds = visibility_timeout_seconds
         self._seen_jobs: set[str] = set()
         self._seen_urls: set[str] = set()
-        self._appearance_counts: dict[str, int] = {}
         self._run_id = uuid.uuid4().hex
 
     @staticmethod
@@ -315,7 +314,7 @@ class DurableProfileQueue:
         account_id: str | None = None,
         handle: str | None = None,
     ) -> bool:
-        return self._send(value, True, company_id, platform, account_id, handle)
+        return self._send(value, company_id, platform, account_id, handle)
 
     def send_snowball(
         self,
@@ -326,12 +325,11 @@ class DurableProfileQueue:
         account_id: str | None = None,
         handle: str | None = None,
     ) -> bool:
-        return self._send(value, False, company_id, platform, account_id, handle)
+        return self._send(value, company_id, platform, account_id, handle)
 
     def begin_run(self) -> None:
         self._seen_jobs.clear()
         self._seen_urls.clear()
-        self._appearance_counts.clear()
         self._run_id = uuid.uuid4().hex
 
     def _message_for(
@@ -367,7 +365,6 @@ class DurableProfileQueue:
     def _send(
         self,
         value: str | QueueMessage,
-        count_appearance: bool,
         company_id: str | None,
         platform: str | None,
         account_id: str | None,
@@ -376,8 +373,6 @@ class DurableProfileQueue:
         message = self._message_for(value, company_id, platform, account_id, handle)
         identity = message.job_identity
         if identity in self._seen_jobs:
-            if count_appearance:
-                self._appearance_counts[identity] = self._appearance_counts.get(identity, 0) + 1
             return False
         self._seen_jobs.add(identity)
         self._seen_urls.add(message.profile_url)
@@ -399,19 +394,7 @@ class DurableProfileQueue:
             self._seen_jobs.discard(identity)
             self._seen_urls.discard(message.profile_url)
             raise
-        self._appearance_counts[identity] = self._appearance_counts.get(identity, 0) + int(count_appearance)
         return True
-
-    def appearance_count(
-        self,
-        value: str,
-        *,
-        company_id: str | None = None,
-        platform: str | None = None,
-        account_id: str | None = None,
-    ) -> int:
-        message = self._message_for(value, company_id, platform, account_id, None)
-        return self._appearance_counts.get(message.job_identity, 0)
 
     def receive(self) -> list[ReceivedProfileMessage]:
         response = self.client.receive_message(

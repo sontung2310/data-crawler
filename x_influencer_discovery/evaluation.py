@@ -169,7 +169,7 @@ def topic_relevance_score(
         topic_terms or [query],
         semantic_similarity=embedding_similarity,
     )
-    score = round(30 * relevance["hybrid_relevance"])
+    score = round(40 * relevance["hybrid_relevance"])
     evidence = []
     if profile.bio:
         evidence.append(f"Public X bio: {profile.bio[:220]}")
@@ -186,7 +186,6 @@ def topic_relevance_score(
 def score_candidate(
     profile: XProfile,
     query: str,
-    source_count: int = 0,
     recent_posts: list[dict] | None = None,
     account_label: str | None = None,
     embedding_similarity: float | None = None,
@@ -200,19 +199,14 @@ def score_candidate(
         recent_posts=recent_posts,
         topic_terms=topic_terms,
     )
-    # This is run-local appearance frequency, not a discovery-source authority
-    # bonus. It does not affect relevance or eligibility.
-    frequency = min(5, max(0, source_count))
-    if source_count:
-        evidence.append(f"Appeared {source_count} time(s) during this run.")
     fscore = follower_score(profile.followers.estimated, max_score=30)
     engagement_metrics = build_engagement_metrics(
         recent_posts or [],
         follower_estimate=profile.followers.estimated,
     )
-    recent = recent_activity_score(profile.recent_activity, max_score=15)
+    recent = recent_activity_score(profile.recent_activity, max_score=10)
     eng = engagement_score(engagement_metrics, max_score=20)
-    total = topic_score + frequency + fscore + recent + eng
+    total = topic_score + fscore + recent + eng
     return ScoredInfluencer(
         rank=0,
         name=profile.name,
@@ -231,13 +225,12 @@ def score_candidate(
         discovery_sources=profile.discovery_sources,
         score_breakdown=ScoreBreakdown(
             topic_relevance=topic_score,
-            frequently_appeared=frequency,
             followers=fscore,
             recent_activity=recent,
             engagement=eng,
             total=total,
         ),
-        confidence="high" if source_count >= 3 and profile.bio else "medium",
+        confidence="high" if len(profile.discovery_sources) >= 3 and profile.bio else "medium",
     )
 
 
@@ -280,7 +273,6 @@ def evaluate_candidate(
     company_domain: str | None = None,
     account_label: str | None = None,
     semantic_similarity: float | None = None,
-    appearance_count: int = 0,
     current_year: int | None = None,
 ) -> CandidateEvaluation:
     """Apply the contract's ordered business eligibility checks to one profile."""
@@ -313,7 +305,6 @@ def evaluate_candidate(
     score = score_candidate(
         profile,
         query=related_terms[0] if related_terms else company_summary,
-        source_count=appearance_count,
         recent_posts=recent_posts,
         account_label=account_label,
         embedding_similarity=semantic_similarity,

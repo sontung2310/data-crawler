@@ -592,25 +592,6 @@ def _store_leaderboard(
         return candidate_store.leaderboard(limit=limit)
 
 
-def _queue_appearance_count(
-    queue: Any,
-    message: ReceivedProfileMessage,
-    *,
-    company_id: str | None,
-    platform: str,
-) -> int:
-    appearance_count = getattr(queue, "appearance_count")
-    try:
-        return int(appearance_count(
-            message.profile_url,
-            company_id=company_id,
-            platform=platform,
-            account_id=message.account_id,
-        ))
-    except TypeError:
-        return int(appearance_count(message.profile_url))
-
-
 def _log_candidate_decision(profile: XProfile, result: Any) -> None:
     """Log one handle's final business decision without content or secrets."""
     relevance_calculated = result.reason in {None, "relevance_below_minimum"}
@@ -631,7 +612,7 @@ def _log_candidate_decision(profile: XProfile, result: Any) -> None:
     score = result.score.score_breakdown
     logger.debug(
         "handle=@%s state=scoring_completed followers=%s lexical=%.4f semantic=%.4f hybrid=%.4f "
-        "final_score=%d score_components={topic_relevance:%d,frequently_appeared:%d,followers:%d,recent_activity:%d,engagement:%d}",
+        "final_score=%d score_components={topic_relevance:%d,followers:%d,recent_activity:%d,engagement:%d}",
         profile.handle,
         profile.followers.estimated,
         relevance["lexical_overlap"],
@@ -639,7 +620,6 @@ def _log_candidate_decision(profile: XProfile, result: Any) -> None:
         relevance["hybrid_relevance"],
         score.total,
         score.topic_relevance,
-        score.frequently_appeared,
         score.followers,
         score.recent_activity,
         score.engagement,
@@ -1354,12 +1334,6 @@ async def _consume_received_profile_batch(
                 company_domain=company_domain,
                 account_label=labels[profile.handle.lower()],
                 semantic_similarity=semantic.get(profile.handle.lower()),
-                appearance_count=_queue_appearance_count(
-                    queue,
-                    message,
-                    company_id=message.company_id or company_id,
-                    platform=message.platform or platform,
-                ),
             )
             _log_candidate_decision(profile, result)
             stop_after_current = False
@@ -2448,7 +2422,6 @@ def evaluate_and_persist_profiles(
     company_domain: str | None,
     settings: Settings,
     candidate_store: Any,
-    appearance_counts: dict[str, int] | None = None,
 ) -> dict[str, int]:
     """Evaluate a fixture or fetched batch and persist only eligible profiles.
 
@@ -2474,7 +2447,6 @@ def evaluate_and_persist_profiles(
             company_domain=company_domain,
             account_label=classification_labels.get(handle),
             semantic_similarity=semantic_similarities.get(handle),
-            appearance_count=(appearance_counts or {}).get(handle, 0),
         )
         if not result.eligible:
             _store_delete(

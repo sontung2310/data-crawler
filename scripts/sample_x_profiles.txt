@@ -1,0 +1,13 @@
+# One X handle or profile URL per line. Blank lines and # comments are ignored.
+# These ten accounts came from the Robotic Marketer run that hit
+# profile_identity_mismatch, so they are a useful fetch smoke list.
+favoritetechgal
+dailydarkweb
+jayminsofficial
+clickupwithada
+oxleeth
+levie
+zenorocha
+shpigford
+rubenhassid
+kanikabk

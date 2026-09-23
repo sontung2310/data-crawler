@@ -6,10 +6,11 @@ import math
 import random
 import re
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from .browser import _rendered_x_profile_surface
+from .browser import _capture_response_after_render, _rendered_x_profile_surface
 from .models import RecentActivity
 from .extractors import (
     SnowballRelationships,
@@ -18,7 +19,7 @@ from .extractors import (
     extract_following_profile_urls,
     extract_relevant_relationship_urls,
 )
-from .x_search import prepare_x_cookies
+from .x_search import prepare_x_cookies, x_browser_context_options
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +29,19 @@ class RecentPostMarkupError(RuntimeError):
 
 
 class XAccessShellRecoveryRequired(RecentPostMarkupError):
-    """The timeline returned X's access/error shell and needs batch recovery."""
+    """The profile page returned X's blank, access, or error shell and needs batch recovery."""
+
+
+@dataclass
+class FetchedXProfilePage:
+    """One authenticated profile visit: identity HTML plus recent posts."""
+
+    posts: list[dict[str, Any]]
+    html: str | None = None
+    profile_surface: Any = None
+    problem: str | None = None
+    final_url: str | None = None
+    http_status: int | None = None
 
 
 class XFollowingRateLimitError(RuntimeError):
@@ -157,19 +170,25 @@ class XRecentPostFetcher:
             self.scroll_delay_max_seconds,
         )
 
+    def has_batch_context(self) -> bool:
+        return self._batch_browser is not None
+
     @asynccontextmanager
     async def batch_context(self):
-        """Reuse one authenticated browser context for one sequential batch.
+        """Reuse one authenticated browser context while the caller holds it.
 
-        Direct ``fetch_one`` callers continue to get a short-lived browser
-        context. The pipeline uses this context manager around one queue batch
-        so the X cookie and browser session are initialized only once.
+        Nested callers share the already-open Chromium so SQS batches do not
+        log in again. Direct ``fetch_one`` callers still get a short-lived
+        browser when no batch context is active.
         """
-        await self.open_batch_context()
+        close_on_exit = self._batch_browser is None
+        if close_on_exit:
+            await self.open_batch_context()
         try:
             yield self
         finally:
-            await self.close_batch_context()
+            if close_on_exit:
+                await self.close_batch_context()
 
     async def open_batch_context(self) -> None:
         """Open the reusable authenticated context for a queue batch."""
@@ -243,6 +262,24 @@ class XRecentPostFetcher:
             return await asyncio.wait_for(
                 browser.fetch_posts_with_profile_surface(handle, posts_per_profile),
                 timeout=self.timeout_ms / 1000 + 10,
+            )
+
+    async def fetch_profile_and_posts(
+        self,
+        handle: str,
+        posts_per_profile: int = 5,
+    ) -> FetchedXProfilePage:
+        """Read identity and recent posts from one authenticated profile visit."""
+        timeout = self.timeout_ms / 1000 + 18
+        if self._batch_browser is not None:
+            return await asyncio.wait_for(
+                self._batch_browser.fetch_profile_and_posts(handle, posts_per_profile),
+                timeout=timeout,
+            )
+        async with self._new_browser() as browser:
+            return await asyncio.wait_for(
+                browser.fetch_profile_and_posts(handle, posts_per_profile),
+                timeout=timeout,
             )
 
     async def fetch_relationships(
@@ -322,7 +359,7 @@ class _RecentPostBrowser:
         from playwright.async_api import async_playwright
         self.pw = await async_playwright().start()
         self.browser = await self.pw.chromium.launch(headless=self.headless)
-        self.context = await self.browser.new_context(viewport={"width": 1280, "height": 1000})
+        self.context = await self.browser.new_context(**x_browser_context_options())
         cookies = prepare_x_cookies(self.x_session)
         if cookies:
             await self.context.add_cookies(cookies)
@@ -348,6 +385,44 @@ class _RecentPostBrowser:
     async def fetch_posts_with_profile_surface(self, handle: str, posts_per_profile: int) -> tuple[list[dict[str, Any]], Any]:
         return await self._fetch_posts(handle, posts_per_profile, capture_profile_surface=True)
 
+    async def fetch_profile_and_posts(self, handle: str, posts_per_profile: int) -> FetchedXProfilePage:
+        page = await self.context.new_page()
+        page.set_default_timeout(self.timeout_ms)
+        requested_url = f"https://x.com/{handle}"
+        try:
+            response = await page.goto(requested_url, wait_until="domcontentloaded")
+            http_status = response.status if response else None
+            html, final_url, problem = await _capture_response_after_render(
+                page,
+                requested_url,
+                http_status=http_status,
+                timeout_ms=self.timeout_ms,
+            )
+            if problem in {"profile_identity_mismatch", "rate_limited"}:
+                raise XAccessShellRecoveryRequired(
+                    f"Unexpected response: {problem} requested_url={requested_url} final_url={final_url}"
+                )
+            if problem:
+                return FetchedXProfilePage(
+                    posts=[],
+                    html=None,
+                    problem=problem,
+                    final_url=final_url,
+                    http_status=http_status,
+                )
+            posts = await self._collect_posts(page, handle, posts_per_profile)
+            html = await page.content()
+            profile_surface = await _rendered_x_profile_surface(page, requested_url)
+            return FetchedXProfilePage(
+                posts=posts,
+                html=html,
+                profile_surface=profile_surface,
+                final_url=final_url,
+                http_status=http_status,
+            )
+        finally:
+            await page.close()
+
     async def _fetch_posts(
         self,
         handle: str,
@@ -365,29 +440,33 @@ class _RecentPostBrowser:
                 if capture_profile_surface
                 else None
             )
-            posts: list[dict[str, Any]] = []
-            markup_error: RecentPostMarkupError | None = None
-            for scroll in range(5):
-                try:
-                    posts = await _extract_posts_from_page(page, handle)
-                    markup_error = None
-                except RecentPostMarkupError as exc:
-                    markup_error = exc
-                    posts = []
-                non_pinned = [p for p in posts if not p.get("is_pinned")]
-                if len(non_pinned) >= posts_per_profile:
-                    break
-                await page.mouse.wheel(0, 2200)
-                await self._wait_between_scrolls(page, handle, scroll + 1)
-            if markup_error is not None and not posts:
-                diagnostics = await _collect_timeline_surface_diagnostics(page, str(markup_error))
-                message = _format_timeline_markup_error(markup_error, diagnostics)
-                if diagnostics.get("surface_state") == "access_or_error_shell":
-                    raise XAccessShellRecoveryRequired(message)
-                raise RecentPostMarkupError(message)
-            return [p for p in posts if not p.get("is_pinned")][:posts_per_profile], profile_surface
+            posts = await self._collect_posts(page, handle, posts_per_profile)
+            return posts, profile_surface
         finally:
             await page.close()
+
+    async def _collect_posts(self, page: Any, handle: str, posts_per_profile: int) -> list[dict[str, Any]]:
+        posts: list[dict[str, Any]] = []
+        markup_error: RecentPostMarkupError | None = None
+        for scroll in range(5):
+            try:
+                posts = await _extract_posts_from_page(page, handle)
+                markup_error = None
+            except RecentPostMarkupError as exc:
+                markup_error = exc
+                posts = []
+            non_pinned = [p for p in posts if not p.get("is_pinned")]
+            if len(non_pinned) >= posts_per_profile:
+                break
+            await page.mouse.wheel(0, 2200)
+            await self._wait_between_scrolls(page, handle, scroll + 1)
+        if markup_error is not None and not posts:
+            diagnostics = await _collect_timeline_surface_diagnostics(page, str(markup_error))
+            message = _format_timeline_markup_error(markup_error, diagnostics)
+            if diagnostics.get("surface_state") == "access_or_error_shell":
+                raise XAccessShellRecoveryRequired(message)
+            raise RecentPostMarkupError(message)
+        return [p for p in posts if not p.get("is_pinned")][:posts_per_profile]
 
     async def fetch_relationships(
         self,

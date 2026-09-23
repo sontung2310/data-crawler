@@ -648,15 +648,12 @@ def _log_batch_summary(batch_number: int, stats: dict[str, int], rejection_reaso
 class SequentialProfileWorker:
     """Fetch one X profile and its recent posts at a time.
 
-    No parallel browser calls are made by this worker. The queue consumer owns
-    the sequencing, so an authenticated X session never has multiple active
-    profile actions.
+    Identity and timeline work share one authenticated Chromium. The queue
+    consumer owns sequencing so an X session never has overlapping profile
+    actions or a second cold login for the same handle.
     """
 
     def __init__(self, settings: Settings):
-        # Use the authenticated session for both profile metadata and recent
-        # post activity. X can reject the anonymous profile request even when
-        # the same profile is available in a normal authenticated browser.
         self.settings = settings
         self.profile_fetcher = PlaywrightFetcher(
             headless=settings.headless, x_session=settings.x_session, timeout_ms=12_000
@@ -670,21 +667,25 @@ class SequentialProfileWorker:
         )
         self._last_fetched_handle: str | None = None
 
+    def _batch_context_is_open(self) -> bool:
+        has_context = getattr(self.post_fetcher, "has_batch_context", None)
+        return bool(has_context()) if callable(has_context) else False
+
     @asynccontextmanager
     async def batch_context(self):
-        """Keep one authenticated X browser context for one queue batch."""
-        self._last_fetched_handle = None
+        """Keep one authenticated X browser while the caller holds this context.
+
+        Nested SQS batches reuse the already-open Chromium instead of logging
+        in again. Handle pacing is preserved across those batches.
+        """
+        close_on_exit = not self._batch_context_is_open()
+        if close_on_exit:
+            await self.open_batch_context()
         try:
-            batch_context = getattr(self.post_fetcher, "batch_context", None)
-            if callable(batch_context):
-                async with batch_context():
-                    yield
-            else:
-                # Preserve compatibility with the small fake post fetchers used by
-                # tests and by callers that inject their own worker dependency.
-                yield
+            yield
         finally:
-            self._last_fetched_handle = None
+            if close_on_exit:
+                await self.close_batch_context()
 
     async def wait_before_handle(self, profile_url: str) -> None:
         """Pace different X handles outside the per-profile timeout."""
@@ -708,6 +709,7 @@ class SequentialProfileWorker:
             result = close_context()
             if inspect.isawaitable(result):
                 await result
+        self._last_fetched_handle = None
 
     async def open_batch_context(self) -> None:
         open_context = getattr(self.post_fetcher, "open_batch_context", None)
@@ -718,6 +720,105 @@ class SequentialProfileWorker:
 
     async def fetch(self, profile_url: str) -> FetchedProfile:
         requested_handle = profile_url.rsplit("/", 1)[-1]
+        fetch_combined = getattr(self.post_fetcher, "fetch_profile_and_posts", None)
+        if callable(fetch_combined):
+            return await self._fetch_combined(profile_url, requested_handle)
+        return await self._fetch_split(profile_url, requested_handle)
+
+    async def fetch_with_recovery(self, profile_url: str, *, timeout_seconds: int | None = None) -> FetchedProfile:
+        """Fetch one profile and recover a blank X access shell outside the timeout."""
+        async def once() -> FetchedProfile:
+            if timeout_seconds is not None:
+                return await asyncio.wait_for(self.fetch(profile_url), timeout=timeout_seconds)
+            return await self.fetch(profile_url)
+
+        try:
+            return await once()
+        except XAccessShellRecoveryRequired as first_error:
+            handle = profile_url.rsplit("/", 1)[-1]
+            logger.warning(
+                "====== Get rate limiting, cooling for 5 minutes then try again ====== handle=@%s",
+                handle,
+            )
+            logger.warning(
+                "handle=@%s state=access_shell_recovery_scheduled attempt=2/2 delay_seconds=%s reason=%s",
+                handle,
+                _X_ACCESS_SHELL_COOLDOWN_SECONDS,
+                first_error,
+            )
+            await self.close_batch_context()
+            await asyncio.sleep(_X_ACCESS_SHELL_COOLDOWN_SECONDS)
+            await self.open_batch_context()
+            logger.debug("handle=@%s state=access_shell_recovery_started attempt=2/2", handle)
+            try:
+                return await once()
+            except XAccessShellRecoveryRequired as second_error:
+                return FetchedProfile(
+                    None,
+                    [],
+                    technical_error=f"recent_posts_failed: {second_error}",
+                )
+
+    async def _fetch_combined(self, profile_url: str, requested_handle: str) -> FetchedProfile:
+        page = None
+        last_error: Exception | None = None
+        for attempt in range(1, _TRANSIENT_X_FETCH_ATTEMPTS + 1):
+            logger.debug(
+                "handle=@%s state=fetch_started attempt=%d/%d",
+                requested_handle,
+                attempt,
+                _TRANSIENT_X_FETCH_ATTEMPTS,
+            )
+            try:
+                page = await self.post_fetcher.fetch_profile_and_posts(requested_handle, posts_per_profile=5)
+                break
+            except XAccessShellRecoveryRequired:
+                raise
+            except (RecentPostMarkupError, TimeoutError) as exc:
+                last_error = exc
+                logger.warning(
+                    "handle=@%s state=fetch_failed attempt=%d/%d reason=%s",
+                    requested_handle,
+                    attempt,
+                    _TRANSIENT_X_FETCH_ATTEMPTS,
+                    exc,
+                )
+                if attempt == _TRANSIENT_X_FETCH_ATTEMPTS:
+                    break
+                await self._retry_delay("timeline", profile_url, attempt, str(exc))
+            except Exception as exc:
+                return FetchedProfile(None, [], technical_error=f"recent_posts_failed: {exc}")
+        if page is None:
+            assert last_error is not None
+            return FetchedProfile(None, [], technical_error=f"recent_posts_failed: {last_error}")
+        if page.problem:
+            return FetchedProfile(
+                None,
+                [],
+                technical_error=f"Unexpected response: {page.problem}",
+                immediate_retry=page.problem == "profile_not_found",
+            )
+        if not page.html:
+            return FetchedProfile(None, [], technical_error="profile_missing")
+        try:
+            profile = extract_x_profile_from_html(
+                requested_handle,
+                page.html,
+                rendered_surface=page.profile_surface,
+            )
+        except Exception as exc:
+            return FetchedProfile(None, [], technical_error=f"profile_parse_failed: {exc}")
+        if profile.source_status != "ok":
+            return FetchedProfile(None, [], technical_error=profile.error or profile.source_status)
+        logger.debug(
+            "handle=@%s state=fetch_completed followers=%s recent_posts=%d",
+            profile.handle,
+            profile.followers.estimated,
+            len(page.posts),
+        )
+        return FetchedProfile(profile, page.posts)
+
+    async def _fetch_split(self, profile_url: str, requested_handle: str) -> FetchedProfile:
         page = None
         for attempt in range(1, _TRANSIENT_X_FETCH_ATTEMPTS + 1):
             logger.debug("handle=@%s state=fetch_started attempt=%d/%d", requested_handle, attempt, _TRANSIENT_X_FETCH_ATTEMPTS)
@@ -776,9 +877,6 @@ class SequentialProfileWorker:
             assert last_post_error is not None
             return FetchedProfile(None, [], technical_error=f"recent_posts_failed: {last_post_error}")
         if timeline_profile_surface is not None:
-            # Keep public-fetch identity and counts authoritative. The
-            # authenticated timeline is a narrowly scoped fallback for fields
-            # that its page actually renders (normally the profile bio).
             profile = replace(
                 profile,
                 bio=profile.bio or timeline_profile_surface.bio,
@@ -897,6 +995,12 @@ async def _fetch_profile_with_access_shell_recovery(
     the normal 30-second account timeout still applies to each actual fetch.
     """
     timeout_seconds = max(1, int(getattr(settings, "account_attempt_timeout_seconds", 30)))
+    fetch_with_recovery = getattr(worker, "fetch_with_recovery", None)
+    if callable(fetch_with_recovery):
+        result = fetch_with_recovery(message.profile_url, timeout_seconds=timeout_seconds)
+        if inspect.isawaitable(result):
+            return await result
+        return result
     try:
         return await asyncio.wait_for(_fetch_profile(worker, message), timeout=timeout_seconds)
     except XAccessShellRecoveryRequired as first_error:
@@ -1794,52 +1898,53 @@ async def _run_durable_with_store(
     handled_profile_urls: set[str] = set()
     run_status = "completed"
     batch_number = 0
-    while True:
-        batch_number += 1
-        batch = await consume_profile_batch(
-            submission_queue,
-            worker,
-            classifier,
-            embedding_matcher,
-            candidate_store,
-            related_terms=related_terms,
-            company_name=company_name,
-            company_id=company_id,
-            platform=platform,
-            company_domain=company_domain,
-            settings=settings,
-            handled_profile_urls=handled_profile_urls,
-            outcome_report=outcome_report,
-            batch_number=batch_number,
-            evidence_store=evidence_store,
-            run_id=run_id,
-        )
-        metrics.add_batch(batch)
-        if batch.get("snowball_rate_limited"):
-            logger.error(
-                "snowball state=stopped_rate_limit resume_required=true; "
-                "the current parent was acknowledged and untouched queue work remains available"
+    async with _worker_batch_context(worker):
+        while True:
+            batch_number += 1
+            batch = await consume_profile_batch(
+                submission_queue,
+                worker,
+                classifier,
+                embedding_matcher,
+                candidate_store,
+                related_terms=related_terms,
+                company_name=company_name,
+                company_id=company_id,
+                platform=platform,
+                company_domain=company_domain,
+                settings=settings,
+                handled_profile_urls=handled_profile_urls,
+                outcome_report=outcome_report,
+                batch_number=batch_number,
+                evidence_store=evidence_store,
+                run_id=run_id,
             )
-            run_status = "stopped_x_rate_limit"
-            break
-        if outcome_report is not None and outcome_report.last_batch_tripped_x_access_circuit_breaker:
-            logger.error(
-                "X-access circuit breaker: %d consecutive first-delivery X-fetch failures; "
-                "later received URLs were deferred for manual --resume; stopping before another batch",
-                settings.x_access_failure_streak_limit,
-            )
-            run_status = "stopped_x_access_errors"
-            break
-        if not batch["received"]:
-            remaining_depth = queue.depth()
-            if remaining_depth <= 0:
+            metrics.add_batch(batch)
+            if batch.get("snowball_rate_limited"):
+                logger.error(
+                    "snowball state=stopped_rate_limit resume_required=true; "
+                    "the current parent was acknowledged and untouched queue work remains available"
+                )
+                run_status = "stopped_x_rate_limit"
                 break
-            logger.debug(
-                "queue idle: remaining_depth=%d; waiting %ds for temporarily invisible retry work",
-                remaining_depth,
-                settings.sqs_idle_poll_seconds,
-            )
-            await asyncio.sleep(settings.sqs_idle_poll_seconds)
+            if outcome_report is not None and outcome_report.last_batch_tripped_x_access_circuit_breaker:
+                logger.error(
+                    "X-access circuit breaker: %d consecutive first-delivery X-fetch failures; "
+                    "later received URLs were deferred for manual --resume; stopping before another batch",
+                    settings.x_access_failure_streak_limit,
+                )
+                run_status = "stopped_x_access_errors"
+                break
+            if not batch["received"]:
+                remaining_depth = queue.depth()
+                if remaining_depth <= 0:
+                    break
+                logger.debug(
+                    "queue idle: remaining_depth=%d; waiting %ds for temporarily invisible retry work",
+                    remaining_depth,
+                    settings.sqs_idle_poll_seconds,
+                )
+                await asyncio.sleep(settings.sqs_idle_poll_seconds)
 
     report = metrics.report(
         queue_depth=queue.depth(),
@@ -2251,7 +2356,7 @@ async def run_durable_pipeline(
                 )
             else:
                 if not settings.mongodb_url:
-                    raise ValueError("MONGODB_URL is required for durable company leaderboard persistence")
+                    raise ValueError("MONGODB_URI is required for durable company leaderboard persistence")
                 with open_company_candidate_store(
                     settings.mongodb_url,
                     company_name,
@@ -2364,7 +2469,7 @@ async def run_snowball_pipeline(
                 )
             else:
                 if not settings.mongodb_url:
-                    raise ValueError("MONGODB_URL is required for durable company leaderboard persistence")
+                    raise ValueError("MONGODB_URI is required for durable company leaderboard persistence")
                 with open_company_candidate_store(
                     settings.mongodb_url,
                     company_name,

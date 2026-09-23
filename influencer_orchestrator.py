@@ -74,8 +74,8 @@ def _settings() -> Settings:
         raise ValueError(
             "INFLUENCER_SQS_MAX_RECEIVE_COUNT must be exactly 1 for the fast-fail delivery policy"
         )
-    session = config.X_BROWSER_SESSION or None
-    if not session and config.X_AUTH_TOKEN and config.X_CT0:
+    session = None
+    if config.X_AUTH_TOKEN and config.X_CT0:
         session = f"auth_token={config.X_AUTH_TOKEN}; ct0={config.X_CT0}"
     return Settings(
         mongodb_url=config.MONGODB_URI,

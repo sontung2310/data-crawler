@@ -6,7 +6,6 @@ import asyncio
 import html as html_lib
 import json
 import logging
-import os
 import random
 import re
 from dataclasses import dataclass, field
@@ -41,8 +40,23 @@ def people_search_queries(query: str) -> list[str]:
     return query_expansions(query) if query else []
 
 
+X_PLAYWRIGHT_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
+
+def x_browser_context_options(*, viewport: dict[str, int] | None = None) -> dict[str, Any]:
+    """Playwright context options that match the working content-crawl client."""
+    return {
+        "user_agent": X_PLAYWRIGHT_USER_AGENT,
+        "viewport": viewport or {"width": 1280, "height": 1000},
+    }
+
+
 def prepare_x_cookies(session: str | None) -> list[dict]:
-    """Convert a raw cookie header or Playwright state into X cookies."""
+    """Convert an ``auth_token`` + ``ct0`` cookie header into Playwright cookies."""
     if not session:
         return []
     session = session.strip()
@@ -52,7 +66,7 @@ def prepare_x_cookies(session: str | None) -> list[dict]:
             return [
                 _cookie(c["name"], c["value"])
                 for c in state.get("cookies", [])
-                if c.get("name") in {"auth_token", "ct0", "twid"} and c.get("value")
+                if c.get("name") in {"auth_token", "ct0"} and c.get("value")
             ]
         except Exception:
             return []
@@ -62,21 +76,25 @@ def prepare_x_cookies(session: str | None) -> list[dict]:
     parsed.load(session)
     cookies = []
     for name, morsel in parsed.items():
-        if name in {"auth_token", "ct0", "twid"}:
+        if name in {"auth_token", "ct0"}:
             cookies.append(_cookie(name, morsel.value))
     return cookies
 
 
 def _cookie(name: str, value: str) -> dict:
-    return {
+    cookie = {
         "name": name,
         "value": value,
         "domain": ".x.com",
         "path": "/",
-        "httpOnly": True,
         "secure": True,
         "sameSite": "Lax",
     }
+    # X's client JS reads ct0 for CSRF. Marking it httpOnly produces the
+    # generic "Something went wrong" / Profile / X shell on timelines.
+    if name == "auth_token":
+        cookie["httpOnly"] = True
+    return cookie
 
 
 def parse_people_cards_from_html(page_html: str, source_url: str | None = None) -> list[PeopleCard]:
@@ -182,10 +200,7 @@ class XPeopleSearcher:
             "source": "x_people_search",
             "queries": queries,
             "query_runs": metas,
-            "logged_in": bool(
-                prepare_x_cookies(self.x_session)
-                or (self.x_session and os.path.exists(self.x_session))
-            ),
+            "logged_in": bool(prepare_x_cookies(self.x_session)),
             "cards_found": len(deduped),
         }
 
@@ -201,16 +216,7 @@ class XPeopleSearcher:
 
             async with async_playwright() as pw:
                 browser = await pw.chromium.launch(headless=self.headless)
-                context_kwargs = {
-                    "user_agent": (
-                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                        "AppleWebKit/537.36 Chrome/126 Safari/537.36"
-                    ),
-                    "viewport": {"width": 1280, "height": 1000},
-                }
-                if self.x_session and os.path.exists(self.x_session):
-                    context_kwargs["storage_state"] = self.x_session
-                context = await browser.new_context(**context_kwargs)
+                context = await browser.new_context(**x_browser_context_options())
                 cookies = prepare_x_cookies(self.x_session)
                 if cookies:
                     await context.add_cookies(cookies)
@@ -378,7 +384,7 @@ class XPostSearcher:
         output: dict[str, list[PostAuthor]] = {}
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(headless=self.headless)
-            context = await browser.new_context(viewport={"width": 1280, "height": 1000})
+            context = await browser.new_context(**x_browser_context_options())
             cookies = prepare_x_cookies(self.x_session)
             if cookies:
                 await context.add_cookies(cookies)

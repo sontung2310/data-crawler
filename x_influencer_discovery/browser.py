@@ -12,7 +12,7 @@ from typing import Iterable
 from urllib.parse import urlparse
 
 from .models import RenderedProfileSurface
-from .x_search import prepare_x_cookies
+from .x_search import prepare_x_cookies, x_browser_context_options
 
 logger = logging.getLogger(__name__)
 
@@ -102,8 +102,7 @@ class _BrowserContext:
             self.playwright = await async_playwright().start()
             self.browser = await self.playwright.chromium.launch(headless=self.headless)
             self.context = await self.browser.new_context(
-                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/126 Safari/537.36",
-                viewport={"width": 1280, "height": 900},
+                **x_browser_context_options(viewport={"width": 1280, "height": 900}),
             )
             if self.x_session:
                 cookies = prepare_x_cookies(self.x_session)

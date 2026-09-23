@@ -235,7 +235,7 @@ def main() -> None:
     elif args.command == "export":
         settings = load_settings(args.env_file)
         if not settings.mongodb_url:
-            export_parser.error("MONGODB_URL is required to export the durable company leaderboard")
+            export_parser.error("MONGODB_URI is required to export the durable company leaderboard")
         if args.platform != "x":
             export_parser.error("dashboard export currently supports only the X platform")
         store_context = open_company_candidate_store(
@@ -289,7 +289,7 @@ def main() -> None:
     elif args.command == "migrate":
         settings = load_settings(args.env_file)
         if not settings.mongodb_url:
-            migrate_parser.error("MONGODB_URL is required for migration")
+            migrate_parser.error("MONGODB_URI is required for migration")
         try:
             from pymongo import MongoClient
         except Exception as exc:  # pragma: no cover - environment-specific

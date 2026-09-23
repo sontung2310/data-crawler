@@ -118,8 +118,7 @@ Content adapters run in a thread pool. Content crawling and influencer discovery
 
 Set in `.env` when an authenticated X session is available:
 
-- `X_AUTH_TOKEN`, `X_CT0` from x.com cookies after login
-- Or `X_BROWSER_SESSION` / `X_SESSION` as a raw cookie header or Playwright storage-state path
+- `X_AUTH_TOKEN`, `X_CT0` from x.com cookies after login. Content crawl, the SQS orchestrator, and `python -m x_influencer_discovery` all use this pair.
 - `REDDIT_SESSION` (optional `REDDIT_TOKEN_V2`) from reddit.com cookies
 
 Without an authenticated session, the reference X Latest lane is marked degraded and the public-search lane can still run. If an authenticated session expires or hits a login wall during fetching, the task records `session_expired`, logs the error, and optionally sends an email if SMTP variables are configured.
@@ -199,6 +198,17 @@ The previous flat content message remains supported and defaults to `content_cra
 `job_id` becomes `task_id` (otherwise a UUID is generated). If the same ID already exists in MongoDB, the consumer skips it.
 
 `field` is included as the first discovery lane together with `related_terms`. X author and scroll limits remain configuration-driven through `X_AUTHORS_PER_QUERY` and `X_MAX_SCROLLS_PER_QUERY`; the current X query retains `min_faves:200`.
+
+### Profile work queue (status / purge)
+
+Influencer profile jobs use one shared SQS FIFO queue per platform (`x-profile-jobs.fifo` plus its DLQ). Check depth or purge with:
+
+```bash
+python scripts/queue_status.py --platform x
+python scripts/purge_company_queues.py --platform x --yes
+```
+
+`--yes` is required for purge. Purge clears both the main queue and DLQ for every company on that platform.
 
 ### Dashboard export
 

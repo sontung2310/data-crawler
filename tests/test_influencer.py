@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import unittest
 from datetime import datetime, timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import influencer_orchestrator as orchestrator
 import persist
-from x_influencer_discovery.config import Settings
+from x_influencer_discovery.config import Settings, resolve_x_session
+from x_influencer_discovery.x_search import prepare_x_cookies
 from x_influencer_discovery.extractors import extract_x_profile_from_html
 from x_influencer_discovery.models import CandidateEvidence, CountValue, XProfile
 from x_influencer_discovery.evaluation import evaluate_candidate
-from x_influencer_discovery.pipeline import produce_x_discovery, run
+from x_influencer_discovery.pipeline import SequentialProfileWorker, produce_x_discovery, run
 from x_influencer_discovery.x_search import PostAuthor
+from x_influencer_discovery.x_profile_posts import FetchedXProfilePage, XAccessShellRecoveryRequired
 
 
 class _Task:
@@ -232,10 +235,14 @@ class TestInfluencerOrchestrator(unittest.TestCase):
         self.assertEqual(settings.classification_backend, "local")
         self.assertTrue(settings.embedding_enabled)
 
-    def test_browser_session_setting_is_forwarded_to_reference(self):
-        with patch.object(orchestrator.config, "X_BROWSER_SESSION", "/tmp/x-state.json"):
+    def test_auth_cookies_are_forwarded_to_reference(self):
+        with (
+            patch.object(orchestrator.config, "X_AUTH_TOKEN", "token"),
+            patch.object(orchestrator.config, "X_CT0", "ct0-value"),
+            patch.object(orchestrator.config, "X_BROWSER_SESSION", "/tmp/x-state.json"),
+        ):
             settings = orchestrator._settings()
-        self.assertEqual(settings.x_session, "/tmp/x-state.json")
+        self.assertEqual(settings.x_session, "auth_token=token; ct0=ct0-value")
 
     def test_topic_brief_normalizes_deduplicates_and_puts_field_first(self):
         normalized = orchestrator._normalize_request(**self.request())
@@ -457,6 +464,135 @@ class TestInfluencerPersistence(unittest.TestCase):
             },
         )
         self.assertEqual(update["$addToSet"]["evidence"]["$each"], [{"type": "x_post", "query": "Marketing"}])
+
+
+_SESSION_ENV = {
+    "X_browser_session": "",
+    "X_BROWSER_SESSION": "",
+    "X_session": "",
+    "X_SESSION": "",
+    "X_AUTH_TOKEN": "",
+    "X_CT0": "",
+}
+
+
+class ResolveXSessionTests(unittest.TestCase):
+    def test_builds_cookie_header_from_auth_token_and_ct0(self):
+        env = {**_SESSION_ENV, "X_AUTH_TOKEN": "token", "X_CT0": "ct0-value"}
+        with patch.dict(os.environ, env, clear=False):
+            self.assertEqual(resolve_x_session(), "auth_token=token; ct0=ct0-value")
+
+    def test_auth_cookies_ignore_x_session_and_browser_session(self):
+        env = {
+            **_SESSION_ENV,
+            "X_BROWSER_SESSION": "/tmp/x-state.json",
+            "X_SESSION": "auth_token=stale; ct0=stale",
+            "X_AUTH_TOKEN": "token",
+            "X_CT0": "ct0-value",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            self.assertEqual(resolve_x_session(), "auth_token=token; ct0=ct0-value")
+
+    def test_missing_ct0_does_not_build_partial_session(self):
+        env = {**_SESSION_ENV, "X_AUTH_TOKEN": "token"}
+        with patch.dict(os.environ, env, clear=False):
+            self.assertIsNone(resolve_x_session())
+
+    def test_ct0_cookie_is_readable_by_page_javascript(self):
+        cookies = {item["name"]: item for item in prepare_x_cookies("auth_token=token; ct0=ct0-value")}
+        self.assertTrue(cookies["auth_token"].get("httpOnly"))
+        self.assertFalse(cookies["ct0"].get("httpOnly"))
+
+
+class _FakeCombinedPostFetcher:
+    def __init__(self, page=None, error=None):
+        self.page = page
+        self.error = error
+        self.calls: list[str] = []
+        self._open = False
+
+    def has_batch_context(self) -> bool:
+        return self._open
+
+    async def open_batch_context(self) -> None:
+        self._open = True
+
+    async def close_batch_context(self) -> None:
+        self._open = False
+
+    async def fetch_profile_and_posts(self, handle: str, posts_per_profile: int = 5) -> FetchedXProfilePage:
+        self.calls.append(handle)
+        if self.error:
+            raise self.error
+        assert self.page is not None
+        return self.page
+
+
+class TestSequentialProfileFetch(unittest.IsolatedAsyncioTestCase):
+    def _worker(self, post_fetcher) -> SequentialProfileWorker:
+        worker = SequentialProfileWorker(Settings())
+        worker.post_fetcher = post_fetcher
+        worker.profile_fetcher.fetch_one = lambda *args, **kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+            AssertionError("identity must not use a second Chromium")
+        )
+        return worker
+
+    async def test_fetch_uses_one_authenticated_profile_visit(self) -> None:
+        html = (
+            '<title>Jane Doe (@janedoe) / X</title>'
+            '<div class="font-bold">12K</div><div>Followers</div>'
+        )
+        page = FetchedXProfilePage(
+            posts=[{"url": "https://x.com/janedoe/status/1", "text": "hello", "created_at": "2026-09-01T00:00:00.000Z"}],
+            html=html,
+        )
+        worker = self._worker(_FakeCombinedPostFetcher(page=page))
+        outcome = await worker.fetch("https://x.com/janedoe")
+        self.assertIsNone(outcome.technical_error)
+        assert outcome.profile is not None
+        self.assertEqual(outcome.profile.handle, "janedoe")
+        self.assertEqual(outcome.profile.followers.estimated, 12000)
+        self.assertEqual(len(outcome.recent_posts), 1)
+
+    async def test_blank_identity_raises_access_shell_recovery(self) -> None:
+        worker = self._worker(
+            _FakeCombinedPostFetcher(error=XAccessShellRecoveryRequired("Unexpected response: profile_identity_mismatch"))
+        )
+        with self.assertRaises(XAccessShellRecoveryRequired):
+            await worker.fetch("https://x.com/janedoe")
+
+    async def test_fetch_with_recovery_reopens_context_after_blank_shell(self) -> None:
+        html = (
+            '<title>Jane Doe (@janedoe) / X</title>'
+            '<div class="font-bold">12K</div><div>Followers</div>'
+        )
+        fetcher = _FakeCombinedPostFetcher()
+
+        async def flaky_fetch(handle: str, posts_per_profile: int = 5) -> FetchedXProfilePage:
+            fetcher.calls.append(handle)
+            if len(fetcher.calls) == 1:
+                raise XAccessShellRecoveryRequired("Unexpected response: profile_identity_mismatch")
+            return FetchedXProfilePage(posts=[], html=html)
+
+        fetcher.fetch_profile_and_posts = flaky_fetch  # type: ignore[method-assign]
+        worker = self._worker(fetcher)
+        with patch("x_influencer_discovery.pipeline.asyncio.sleep", new=AsyncMock()):
+            outcome = await worker.fetch_with_recovery("https://x.com/janedoe")
+        self.assertIsNone(outcome.technical_error)
+        assert outcome.profile is not None
+        self.assertEqual(outcome.profile.handle, "janedoe")
+        self.assertEqual(fetcher.calls, ["janedoe", "janedoe"])
+
+    async def test_batch_context_is_reused_by_nested_callers(self) -> None:
+        fetcher = _FakeCombinedPostFetcher()
+        worker = SequentialProfileWorker(Settings())
+        worker.post_fetcher = fetcher
+        async with worker.batch_context():
+            self.assertTrue(fetcher.has_batch_context())
+            async with worker.batch_context():
+                self.assertTrue(fetcher.has_batch_context())
+            self.assertTrue(fetcher.has_batch_context())
+        self.assertFalse(fetcher.has_batch_context())
 
 
 if __name__ == "__main__":

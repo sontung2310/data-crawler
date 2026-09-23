@@ -64,6 +64,27 @@ class Settings:
     x_access_failure_streak_limit: int = 3
 
 
+def _env_text(*names: str) -> str:
+    for name in names:
+        value = (os.getenv(name) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def resolve_x_session() -> str | None:
+    """Build the authenticated X session from ``X_AUTH_TOKEN`` and ``X_CT0``.
+
+    Influencer discovery uses the same cookie pair as content crawl. It does
+    not read ``X_SESSION`` / ``X_BROWSER_SESSION``.
+    """
+    token = _env_text("X_AUTH_TOKEN")
+    ct0 = _env_text("X_CT0")
+    if token and ct0:
+        return f"auth_token={token}; ct0={ct0}"
+    return None
+
+
 def load_settings(env_file: str | None = None) -> Settings:
     if load_dotenv:
         load_dotenv(env_file or ".env")
@@ -140,7 +161,7 @@ def load_settings(env_file: str | None = None) -> Settings:
     platform = validate_platform(os.getenv("PLATFORM", defaults.platform))
 
     return Settings(
-        mongodb_url=os.getenv("MongoDB_URL") or os.getenv("MONGODB_URL") or defaults.mongodb_url,
+        mongodb_url=os.getenv("MONGODB_URI") or defaults.mongodb_url,
         database_host=(os.getenv("DATABASE_HOST") or os.getenv("DASHBOARD_DATABASE_HOST") or defaults.database_host),
         database_name=(os.getenv("DATABASE_NAME") or os.getenv("DASHBOARD_DATABASE_NAME") or defaults.database_name),
         database_username=(os.getenv("DATABASE_USERNAME") or os.getenv("DASHBOARD_DATABASE_USERNAME") or defaults.database_username),
@@ -150,13 +171,7 @@ def load_settings(env_file: str | None = None) -> Settings:
         classification_backend=os.getenv("CLASSIFICATION_BACKEND", defaults.classification_backend).lower(),
         local_classifier_model=Path(os.getenv("LOCAL_CLASSIFIER_MODEL", str(defaults.local_classifier_model))),
         local_classifier_device=os.getenv("LOCAL_CLASSIFIER_DEVICE", defaults.local_classifier_device),
-        x_session=(
-            os.getenv("X_browser_session")
-            or os.getenv("X_BROWSER_SESSION")
-            or os.getenv("X_session")
-            or os.getenv("X_SESSION")
-            or defaults.x_session
-        ),
+        x_session=resolve_x_session() or defaults.x_session,
         embedding_enabled=_boolean("EMBEDDING_ENABLED", defaults.embedding_enabled),
         embedding_model=os.getenv("EMBEDDING_MODEL", defaults.embedding_model),
         headless=_boolean("HEADLESS", defaults.headless),

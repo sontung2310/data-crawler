@@ -118,7 +118,7 @@ Content adapters run in a thread pool. Content crawling and influencer discovery
 
 Set in `.env` when an authenticated X session is available:
 
-- `X_AUTH_TOKEN`, `X_CT0` from x.com cookies after login. Content crawl, the SQS orchestrator, and `python -m x_influencer_discovery` all use this pair.
+- `X_AUTH_TOKEN`, `X_CT0` from x.com cookies after login. Content crawl, the SQS orchestrator, and `python -m x_influencer_discovery` all prefer this pair. If it is absent, influencer discovery also accepts `X_SESSION` or `X_BROWSER_SESSION`. The same session is sent on the profile page, the timeline, and X Latest search. A cookie-less profile page is rejected by X with HTTP 403.
 - `REDDIT_SESSION` (optional `REDDIT_TOKEN_V2`) from reddit.com cookies
 
 Without an authenticated session, the reference X Latest lane is marked degraded and the public-search lane can still run. If an authenticated session expires or hits a login wall during fetching, the task records `session_expired`, logs the error, and optionally sends an email if SMTP variables are configured.
@@ -197,7 +197,7 @@ The previous flat content message remains supported and defaults to `content_cra
 
 `job_id` becomes `task_id` (otherwise a UUID is generated). If the same ID already exists in MongoDB, the consumer skips it.
 
-`field` is included as the first discovery lane together with `related_terms`. X author and scroll limits remain configuration-driven through `X_AUTHORS_PER_QUERY` and `X_MAX_SCROLLS_PER_QUERY`; the current X query retains `min_faves:200`.
+Discovery searches `related_terms` only. `field` is the topic label and is not added as an extra search lane. X author and scroll limits remain configuration-driven through `X_AUTHORS_PER_QUERY` and `X_MAX_SCROLLS_PER_QUERY`; the current X query retains `min_faves:200`. The snowball hybrid-relevance threshold defaults to `0.45` (`GOOD_HYBRID_RELEVANCE_THRESHOLD`). A run stops after `X_ACCESS_FAILURE_STREAK_LIMIT` consecutive first-delivery X fetch failures (default 5). A failed profile or timeline fetch waits 5 seconds before its one local retry.
 
 ### Profile work queue (status / purge)
 

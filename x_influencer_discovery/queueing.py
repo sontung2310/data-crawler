@@ -191,6 +191,7 @@ class DurableProfileQueue:
         self.visibility_timeout_seconds = visibility_timeout_seconds
         self._seen_jobs: set[str] = set()
         self._seen_urls: set[str] = set()
+        self._appearance_counts: dict[str, int] = {}
         self._run_id = uuid.uuid4().hex
 
     @staticmethod
@@ -314,7 +315,7 @@ class DurableProfileQueue:
         account_id: str | None = None,
         handle: str | None = None,
     ) -> bool:
-        return self._send(value, company_id, platform, account_id, handle)
+        return self._send(value, company_id, platform, account_id, handle, count_appearance=True)
 
     def send_snowball(
         self,
@@ -325,12 +326,17 @@ class DurableProfileQueue:
         account_id: str | None = None,
         handle: str | None = None,
     ) -> bool:
-        return self._send(value, company_id, platform, account_id, handle)
+        return self._send(value, company_id, platform, account_id, handle, count_appearance=False)
 
     def begin_run(self) -> None:
         self._seen_jobs.clear()
         self._seen_urls.clear()
+        self._appearance_counts.clear()
         self._run_id = uuid.uuid4().hex
+
+    def appearance_count(self, value: str) -> int:
+        """Return how many direct-discovery sightings this run recorded for a URL."""
+        return self._appearance_counts.get(normalize_profile_url(value), 0)
 
     def _message_for(
         self,
@@ -369,10 +375,15 @@ class DurableProfileQueue:
         platform: str | None,
         account_id: str | None,
         handle: str | None,
+        *,
+        count_appearance: bool,
     ) -> bool:
         message = self._message_for(value, company_id, platform, account_id, handle)
         identity = message.job_identity
         if identity in self._seen_jobs:
+            if count_appearance:
+                url = message.profile_url
+                self._appearance_counts[url] = self._appearance_counts.get(url, 0) + 1
             return False
         self._seen_jobs.add(identity)
         self._seen_urls.add(message.profile_url)
@@ -394,6 +405,9 @@ class DurableProfileQueue:
             self._seen_jobs.discard(identity)
             self._seen_urls.discard(message.profile_url)
             raise
+        if count_appearance:
+            url = message.profile_url
+            self._appearance_counts[url] = self._appearance_counts.get(url, 0) + 1
         return True
 
     def receive(self) -> list[ReceivedProfileMessage]:

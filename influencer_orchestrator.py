@@ -77,6 +77,8 @@ def _settings() -> Settings:
     session = None
     if config.X_AUTH_TOKEN and config.X_CT0:
         session = f"auth_token={config.X_AUTH_TOKEN}; ct0={config.X_CT0}"
+    elif config.X_BROWSER_SESSION:
+        session = config.X_BROWSER_SESSION
     return Settings(
         mongodb_url=config.MONGODB_URI,
         database_host=getattr(config, "DASHBOARD_DATABASE_HOST", None),
@@ -200,7 +202,6 @@ def _normalize_request(
         raise ValueError("limit must be between 1 and 100")
 
     brief = TopicBrief.build(field, terms)
-    all_terms = brief.topic_terms(len(brief.related_terms) + 1)
     return {
         "company_id": company_id,
         "company_name": company_name,
@@ -208,7 +209,7 @@ def _normalize_request(
         "company_summary": company_summary,
         "field": brief.field,
         "related_terms": brief.related_terms,
-        "topic_terms": all_terms,
+        "topic_terms": list(brief.related_terms),
         "language": brief.language,
         "platform": platform,
         "limit": int(limit),
@@ -333,7 +334,7 @@ def run_influencer_task(task_id: str, **request: Any) -> None:
             company_name=normalized["company_name"],
             company_domain=normalized["company_domain"],
             platform=platform,
-            related_terms=normalized["topic_terms"],
+            related_terms=normalized["related_terms"],
             candidate_store=store,
             queue=queue,
             evidence_store=evidence_ledger,

@@ -40,7 +40,7 @@ class Settings:
     company_summary: str | None = None
     minimum_followers: int = 10_000
     minimum_relevance_score: float = 0.20
-    good_hybrid_relevance_threshold: float = 0.60
+    good_hybrid_relevance_threshold: float = 0.45
     profile_refresh_after_hours: int = 24
     leaderboard_max_age_days: int = 30
     enable_snowball: bool = False
@@ -53,15 +53,15 @@ class Settings:
     sqs_idle_poll_seconds: int = 5
     sqs_max_receive_count: int = 1
     account_attempt_timeout_seconds: int = 30
-    x_local_retry_delay_seconds: float = 0.0
-    x_handle_delay_min_seconds: float = 3.0
-    x_handle_delay_max_seconds: float = 6.0
+    x_local_retry_delay_seconds: float = 5.0
+    x_handle_delay_min_seconds: float = 0.0
+    x_handle_delay_max_seconds: float = 0.0
     x_scroll_delay_min_seconds: float = 1.5
     x_scroll_delay_max_seconds: float = 3.0
     playwright_concurrency: int = 1
     x_worker_lock_path: Path = Path("/tmp/x-influencer-discovery.x-worker.lock")
     x_fetch_log_dir: Path = Path("logs")
-    x_access_failure_streak_limit: int = 3
+    x_access_failure_streak_limit: int = 5
 
 
 def _env_text(*names: str) -> str:
@@ -73,16 +73,18 @@ def _env_text(*names: str) -> str:
 
 
 def resolve_x_session() -> str | None:
-    """Build the authenticated X session from ``X_AUTH_TOKEN`` and ``X_CT0``.
+    """Build the authenticated X session.
 
-    Influencer discovery uses the same cookie pair as content crawl. It does
-    not read ``X_SESSION`` / ``X_BROWSER_SESSION``.
+    ``X_AUTH_TOKEN`` and ``X_CT0`` win, matching content crawl. When that pair
+    is absent, ``X_SESSION`` / ``X_BROWSER_SESSION`` is accepted so a standalone
+    influencer ``.env`` still logs in.
     """
     token = _env_text("X_AUTH_TOKEN")
     ct0 = _env_text("X_CT0")
     if token and ct0:
         return f"auth_token={token}; ct0={ct0}"
-    return None
+    session = _env_text("X_BROWSER_SESSION", "X_browser_session", "X_SESSION", "X_session")
+    return session or None
 
 
 def load_settings(env_file: str | None = None) -> Settings:
@@ -161,7 +163,7 @@ def load_settings(env_file: str | None = None) -> Settings:
     platform = validate_platform(os.getenv("PLATFORM", defaults.platform))
 
     return Settings(
-        mongodb_url=os.getenv("MONGODB_URI") or defaults.mongodb_url,
+        mongodb_url=os.getenv("MONGODB_URI") or os.getenv("MONGODB_URL") or defaults.mongodb_url,
         database_host=(os.getenv("DATABASE_HOST") or os.getenv("DASHBOARD_DATABASE_HOST") or defaults.database_host),
         database_name=(os.getenv("DATABASE_NAME") or os.getenv("DASHBOARD_DATABASE_NAME") or defaults.database_name),
         database_username=(os.getenv("DATABASE_USERNAME") or os.getenv("DASHBOARD_DATABASE_USERNAME") or defaults.database_username),

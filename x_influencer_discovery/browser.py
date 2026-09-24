@@ -331,6 +331,15 @@ def _response_problem(requested_url: str, final_url: str, http_status: int | Non
             rf'<meta[^>]+(?:property|name)=["\']og:url["\'][^>]+content=["\'][^"\']*/{re.escape(handle)}(?:["\'/])',
         )
         if not any(re.search(pattern, html, re.I) for pattern in identity_patterns):
+            normalized_html = html.casefold().replace("\u2019", "'").replace("\u2018", "'")
+            # A logged-in session reports a missing account as HTTP 200 with this
+            # sentence, not as HTTP 404.
+            if "this account doesn't exist" in normalized_html:
+                return "profile_not_found"
+            # A document can be HTTP 200 while the profile APIs are rate limited.
+            # X then renders "Something went wrong" and never the requested handle.
+            if "something went wrong" in normalized_html:
+                return "rate_limited"
             return "profile_identity_mismatch"
     return None
 

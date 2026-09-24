@@ -109,6 +109,7 @@ class RecentActivity:
 @dataclass
 class ScoreBreakdown:
     topic_relevance: int
+    frequently_appeared: int
     followers: int
     recent_activity: int
     engagement: int

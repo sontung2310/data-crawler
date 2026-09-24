@@ -122,12 +122,15 @@ class XFetchOutcomeReport:
         company_id: str | None = None,
         platform: str = "x",
         refresh_after_hours: int = 24,
+        discovery_terms: list[str] | None = None,
     ):
         self.company_name = company_name
         self.company_id = company_id
         self.platform = platform
         self.log_dir = log_dir
         self.refresh_after_hours = refresh_after_hours
+        self.discovery_terms = list(discovery_terms or [])
+        self.queue_received = 0
         self.run_id = uuid.uuid4().hex[:12]
         self.started_at = datetime.now(SYDNEY_TIMEZONE)
         self._source_urls = {"x_post": set(), "public_search": set()}
@@ -212,7 +215,19 @@ class XFetchOutcomeReport:
                 "platform": self.platform,
                 "started_at": self.started_at.isoformat(),
                 "ended_at": ended_at.isoformat(),
-                "discovery": discovery,
+                "discovery": {
+                    **discovery,
+                    "terms": list(self.discovery_terms),
+                    "x_post_handles": [
+                        self._handle_entry(handle)
+                        for handle in sorted(self._source_urls["x_post"])
+                    ],
+                    "public_search_handles": [
+                        self._handle_entry(handle)
+                        for handle in sorted(self._source_urls["public_search"])
+                    ],
+                },
+                "queue": {"received": self.queue_received},
                 "skipped_existing_fresh": {
                     "freshness_window_hours": self.refresh_after_hours,
                     "count": len(self._fresh_handles),
@@ -612,7 +627,7 @@ def _log_candidate_decision(profile: XProfile, result: Any) -> None:
     score = result.score.score_breakdown
     logger.debug(
         "handle=@%s state=scoring_completed followers=%s lexical=%.4f semantic=%.4f hybrid=%.4f "
-        "final_score=%d score_components={topic_relevance:%d,followers:%d,recent_activity:%d,engagement:%d}",
+        "final_score=%d score_components={topic_relevance:%d,frequently_appeared:%d,followers:%d,recent_activity:%d,engagement:%d}",
         profile.handle,
         profile.followers.estimated,
         relevance["lexical_overlap"],
@@ -620,6 +635,7 @@ def _log_candidate_decision(profile: XProfile, result: Any) -> None:
         relevance["hybrid_relevance"],
         score.total,
         score.topic_relevance,
+        score.frequently_appeared,
         score.followers,
         score.recent_activity,
         score.engagement,
@@ -648,9 +664,9 @@ def _log_batch_summary(batch_number: int, stats: dict[str, int], rejection_reaso
 class SequentialProfileWorker:
     """Fetch one X profile and its recent posts at a time.
 
-    Identity and timeline work share one authenticated Chromium. The queue
-    consumer owns sequencing so an X session never has overlapping profile
-    actions or a second cold login for the same handle.
+    Profile metadata and recent posts both use the authenticated session.
+    X answers a cookie-less profile page with HTTP 403, which the queue treats
+    as a fetch failure and never reaches the timeline.
     """
 
     def __init__(self, settings: Settings):
@@ -720,9 +736,6 @@ class SequentialProfileWorker:
 
     async def fetch(self, profile_url: str) -> FetchedProfile:
         requested_handle = profile_url.rsplit("/", 1)[-1]
-        fetch_combined = getattr(self.post_fetcher, "fetch_profile_and_posts", None)
-        if callable(fetch_combined):
-            return await self._fetch_combined(profile_url, requested_handle)
         return await self._fetch_split(profile_url, requested_handle)
 
     async def fetch_with_recovery(self, profile_url: str, *, timeout_seconds: int | None = None) -> FetchedProfile:
@@ -820,6 +833,7 @@ class SequentialProfileWorker:
 
     async def _fetch_split(self, profile_url: str, requested_handle: str) -> FetchedProfile:
         page = None
+        rate_limit_cooled_down = False
         for attempt in range(1, _TRANSIENT_X_FETCH_ATTEMPTS + 1):
             logger.debug("handle=@%s state=fetch_started attempt=%d/%d", requested_handle, attempt, _TRANSIENT_X_FETCH_ATTEMPTS)
             page = await self.profile_fetcher.fetch_one(profile_url)
@@ -829,6 +843,14 @@ class SequentialProfileWorker:
                 "handle=@%s state=fetch_failed attempt=%d/%d reason=%s",
                 requested_handle, attempt, _TRANSIENT_X_FETCH_ATTEMPTS, page.error or page.status,
             )
+            if page.status == "rate_limited" and not rate_limit_cooled_down:
+                rate_limit_cooled_down = True
+                logger.warning(
+                    "====== Get rate limiting, cooling for 5 minutes then try again ====== handle=@%s",
+                    requested_handle,
+                )
+                await asyncio.sleep(_X_ACCESS_SHELL_COOLDOWN_SECONDS)
+                continue
             if page.status not in _RETRYABLE_PROFILE_FETCH_STATUSES or attempt == _TRANSIENT_X_FETCH_ATTEMPTS:
                 break
             await self._retry_delay("profile", profile_url, attempt, page.error or page.status)
@@ -1285,12 +1307,7 @@ async def _consume_received_profile_batch(
             continue
         message = deliveries[0]
         try:
-            wait_before_handle = getattr(worker, "wait_before_handle", None)
-            if callable(wait_before_handle):
-                result = wait_before_handle(profile_url)
-                if inspect.isawaitable(result):
-                    await result
-            outcome = await _fetch_profile_with_access_shell_recovery(worker, message, settings)
+            outcome = await _fetch_profile(worker, message)
         except Exception as exc:
             logger.warning("profile fetch fast-fail for %s: %s", profile_url, exc)
             if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
@@ -1427,6 +1444,10 @@ async def _consume_received_profile_batch(
         assert profile is not None and message.profile_url is not None
         try:
             logger.debug("handle=@%s state=evaluation_started", profile.handle)
+            appearance_count = 0
+            counter = getattr(queue, "appearance_count", None)
+            if callable(counter) and message.profile_url:
+                appearance_count = int(counter(message.profile_url))
             result = evaluate_candidate(
                 profile,
                 outcome.recent_posts,
@@ -1438,6 +1459,7 @@ async def _consume_received_profile_batch(
                 company_domain=company_domain,
                 account_label=labels[profile.handle.lower()],
                 semantic_similarity=semantic.get(profile.handle.lower()),
+                appearance_count=appearance_count,
             )
             _log_candidate_decision(profile, result)
             stop_after_current = False
@@ -2335,6 +2357,7 @@ async def run_durable_pipeline(
         company_id=resolved_company_id,
         platform=resolved_platform,
         refresh_after_hours=settings.profile_refresh_after_hours,
+        discovery_terms=terms,
     )
     output: dict[str, Any] | None = None
     report_status = "failed"
@@ -2376,6 +2399,9 @@ async def run_durable_pipeline(
         raise
     finally:
         try:
+            if output is not None:
+                queue_metrics = (output.get("metrics") or {}).get("queue") or {}
+                outcome_report.queue_received = int(queue_metrics.get("received") or 0)
             report_path = outcome_report.write(status=report_status)
             logger.debug("X-fetch outcome report saved: %s", report_path)
         except Exception:
@@ -2436,6 +2462,7 @@ async def run_snowball_pipeline(
         company_id=resolved_company_id,
         platform=resolved_platform,
         refresh_after_hours=settings.profile_refresh_after_hours,
+        discovery_terms=terms,
     )
     result: dict[str, Any] | None = None
     report_status = "failed"
@@ -2527,6 +2554,7 @@ def evaluate_and_persist_profiles(
     company_domain: str | None,
     settings: Settings,
     candidate_store: Any,
+    appearance_counts: dict[str, int] | None = None,
 ) -> dict[str, int]:
     """Evaluate a fixture or fetched batch and persist only eligible profiles.
 
@@ -2552,6 +2580,7 @@ def evaluate_and_persist_profiles(
             company_domain=company_domain,
             account_label=classification_labels.get(handle),
             semantic_similarity=semantic_similarities.get(handle),
+            appearance_count=(appearance_counts or {}).get(handle, 0),
         )
         if not result.eligible:
             _store_delete(

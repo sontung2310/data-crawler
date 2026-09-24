@@ -3,128 +3,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 import math
-from collections import Counter
 from typing import Any
 
 from .models import ScoreBreakdown, ScoredInfluencer, XProfile
-from .querying import STOPWORDS, lexical_match_details, normalize_lexical_text
+from .relevance import hybrid_relevance
 from .x_profile_posts import (
     build_engagement_metrics,
     engagement_score,
     recent_activity_from_posts,
     recent_activity_score,
 )
-
-
-def _keyword_weight(distinct_term_count: int) -> float:
-    """Saturate repeated keyword importance without an abrupt hard cap."""
-    return 2.0 * distinct_term_count / (distinct_term_count + 1)
-
-
-def _prepare_terms(related_terms: list[str]) -> list[tuple[str, str, tuple[str, ...]]]:
-    """Return display term, normalized key, and unique normalized words."""
-    prepared: list[tuple[str, str, tuple[str, ...]]] = []
-    seen: set[str] = set()
-    for raw_term in related_terms:
-        display_term = " ".join(str(raw_term).split())
-        normalized_term = normalize_lexical_text(display_term)
-        if not normalized_term or normalized_term in seen:
-            continue
-        seen.add(normalized_term)
-        words = tuple(dict.fromkeys(
-            word for word in normalized_term.split()
-            if word not in STOPWORDS
-        ))
-        if not words:
-            continue
-        prepared.append((display_term, normalized_term, words))
-    return prepared
-
-
-def _term_weights(
-    related_terms: list[str],
-) -> tuple[list[tuple[str, str, tuple[str, ...]]], dict[str, float], dict[str, int]]:
-    prepared = _prepare_terms(related_terms)
-    distinct_term_counts: Counter[str] = Counter(
-        word
-        for _, _, words in prepared
-        for word in set(words)
-    )
-    word_weights = {
-        word: _keyword_weight(count)
-        for word, count in distinct_term_counts.items()
-    }
-    phrase_weights = {
-        normalized_term: sum(word_weights[word] for word in words) / len(words)
-        for _, normalized_term, words in prepared
-    }
-    return prepared, phrase_weights, dict(distinct_term_counts)
-
-
-def _coverage(text: str, related_terms: list[str]) -> tuple[float, list[str]]:
-    prepared, phrase_weights, distinct_term_counts = _term_weights(related_terms)
-    if not prepared:
-        return 0.0, []
-
-    matched_weight = 0.0
-    hits: list[str] = []
-    for display_term, normalized_term, _ in prepared:
-        strength, matched_words = lexical_match_details(normalized_term, text or "")
-        if not strength:
-            continue
-        # A shared generic word such as "marketing" must not create half-credit
-        # for every phrase containing it. Partial credit needs a distinctive
-        # non-stop word that appears in only one configured term.
-        matched_content_words = matched_words - STOPWORDS
-        if strength < 1.0 and not any(
-            distinct_term_counts[word] == 1 for word in matched_content_words
-        ):
-            continue
-        matched_weight += phrase_weights[normalized_term] * strength
-        hits.append(display_term)
-
-    return round(min(1.0, matched_weight / 5.0), 4), hits
-
-
-def lexical_overlap(bio: str, posts: list[dict[str, Any]], related_terms: list[str]) -> dict[str, Any]:
-    """Calculate weighted keyword evidence across a bio and up to five posts."""
-    bio_coverage, bio_hits = _coverage(bio, related_terms)
-    surfaces = [_coverage(str(post.get("text") or ""), related_terms) for post in posts[:5]]
-    post_coverage = sum(score for score, _ in surfaces) / len(surfaces) if surfaces else 0.0
-    post_consistency = sum(score > 0 for score, _ in surfaces) / len(surfaces) if surfaces else 0.0
-    value = 0.45 * bio_coverage + 0.40 * post_coverage + 0.15 * post_consistency
-    return {
-        "lexical_overlap": round(value, 4),
-        "bio_coverage": round(bio_coverage, 4),
-        "post_coverage": round(post_coverage, 4),
-        "post_consistency": round(post_consistency, 4),
-        "bio_hits": bio_hits,
-        "post_hits": [hits for _, hits in surfaces],
-    }
-
-
-def normalize_semantic_similarity(similarity: float | None) -> float:
-    """Normalize a MiniLM cosine score from ``[-1, 1]`` to ``[0, 1]``."""
-    if similarity is None:
-        return 0.0
-    return round(min(1.0, max(0.0, (float(similarity) + 1.0) / 2.0)), 4)
-
-
-def hybrid_relevance(
-    bio: str,
-    posts: list[dict[str, Any]],
-    related_terms: list[str],
-    *,
-    semantic_similarity: float | None,
-) -> dict[str, Any]:
-    """Combine deterministic lexical overlap and local semantic similarity."""
-    lexical = lexical_overlap(bio, posts, related_terms)
-    semantic = normalize_semantic_similarity(semantic_similarity)
-    return {
-        **lexical,
-        "semantic_similarity": semantic,
-        "hybrid_relevance": round(0.60 * lexical["lexical_overlap"] + 0.40 * semantic, 4),
-    }
 
 
 def follower_score(count: int | None, max_score: int = 30) -> int:
@@ -186,6 +74,7 @@ def topic_relevance_score(
 def score_candidate(
     profile: XProfile,
     query: str,
+    source_count: int = 0,
     recent_posts: list[dict] | None = None,
     account_label: str | None = None,
     embedding_similarity: float | None = None,
@@ -199,14 +88,18 @@ def score_candidate(
         recent_posts=recent_posts,
         topic_terms=topic_terms,
     )
-    fscore = follower_score(profile.followers.estimated, max_score=30)
+    # Run-local appearance frequency. It does not affect relevance or eligibility.
+    frequency = min(10, max(0, source_count) * 2)
+    if source_count:
+        evidence.append(f"Appeared {source_count} time(s) during this run.")
+    fscore = follower_score(profile.followers.estimated, max_score=20)
     engagement_metrics = build_engagement_metrics(
         recent_posts or [],
         follower_estimate=profile.followers.estimated,
     )
-    recent = recent_activity_score(profile.recent_activity, max_score=10)
-    eng = engagement_score(engagement_metrics, max_score=20)
-    total = topic_score + fscore + recent + eng
+    recent = recent_activity_score(profile.recent_activity, max_score=15)
+    eng = engagement_score(engagement_metrics, max_score=15)
+    total = topic_score + frequency + fscore + recent + eng
     return ScoredInfluencer(
         rank=0,
         name=profile.name,
@@ -225,12 +118,13 @@ def score_candidate(
         discovery_sources=profile.discovery_sources,
         score_breakdown=ScoreBreakdown(
             topic_relevance=topic_score,
+            frequently_appeared=frequency,
             followers=fscore,
             recent_activity=recent,
             engagement=eng,
             total=total,
         ),
-        confidence="high" if len(profile.discovery_sources) >= 3 and profile.bio else "medium",
+        confidence="high" if source_count >= 3 and profile.bio else "medium",
     )
 
 
@@ -273,6 +167,7 @@ def evaluate_candidate(
     company_domain: str | None = None,
     account_label: str | None = None,
     semantic_similarity: float | None = None,
+    appearance_count: int = 0,
     current_year: int | None = None,
 ) -> CandidateEvaluation:
     """Apply the contract's ordered business eligibility checks to one profile."""
@@ -305,6 +200,7 @@ def evaluate_candidate(
     score = score_candidate(
         profile,
         query=related_terms[0] if related_terms else company_summary,
+        source_count=appearance_count,
         recent_posts=recent_posts,
         account_label=account_label,
         embedding_similarity=semantic_similarity,

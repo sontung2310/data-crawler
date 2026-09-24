@@ -95,7 +95,7 @@ def _session_analysis(cli_settings: Settings) -> dict[str, Any]:
         "cli_load_settings_has_session": bool(cli_settings.x_session),
         "x_auth_token_present": _env_present("X_AUTH_TOKEN"),
         "x_ct0_present": _env_present("X_CT0"),
-        "note": "load_settings() uses X_AUTH_TOKEN + X_CT0 only; it does not read X_SESSION or X_BROWSER_SESSION.",
+        "note": "load_settings() prefers X_AUTH_TOKEN + X_CT0, then X_SESSION or X_BROWSER_SESSION.",
     }
 
 
@@ -222,7 +222,14 @@ def _diagnosis(
     if page.get("response_problem") == "profile_redirected":
         return "X redirected the requested profile URL; verify the account still exists and the session can access it."
     if page.get("response_problem") == "rate_limited":
-        return "X returned HTTP 429 (rate limited)."
+        status = page.get("http_status")
+        if status == 429:
+            return "X returned HTTP 429 (rate limited)."
+        return (
+            "X returned the profile document, but the page is the 'Something went wrong' "
+            f"shell (document HTTP {status}). That is a rate limit on the profile APIs, "
+            "not an expired X_AUTH_TOKEN."
+        )
     if page.get("response_problem") == "profile_not_found":
         return "X returned HTTP 404; the handle may not exist."
     if parsed.get("status") == "error":

@@ -4,10 +4,11 @@ import asyncio
 import os
 import unittest
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import influencer_orchestrator as orchestrator
 import persist
+from x_influencer_discovery.browser import FetchResult, _response_problem
 from x_influencer_discovery.config import Settings, resolve_x_session
 from x_influencer_discovery.x_search import prepare_x_cookies
 from x_influencer_discovery.extractors import extract_x_profile_from_html
@@ -15,7 +16,7 @@ from x_influencer_discovery.models import CandidateEvidence, CountValue, XProfil
 from x_influencer_discovery.evaluation import evaluate_candidate
 from x_influencer_discovery.pipeline import SequentialProfileWorker, produce_x_discovery, run
 from x_influencer_discovery.x_search import PostAuthor
-from x_influencer_discovery.x_profile_posts import FetchedXProfilePage, XAccessShellRecoveryRequired
+from x_influencer_discovery.x_profile_posts import FetchedXProfilePage
 
 
 class _Task:
@@ -244,14 +245,12 @@ class TestInfluencerOrchestrator(unittest.TestCase):
             settings = orchestrator._settings()
         self.assertEqual(settings.x_session, "auth_token=token; ct0=ct0-value")
 
-    def test_topic_brief_normalizes_deduplicates_and_puts_field_first(self):
+    def test_topic_brief_searches_related_terms_only(self):
         normalized = orchestrator._normalize_request(**self.request())
         self.assertEqual(normalized["field"], "Marketing")
         self.assertEqual(normalized["related_terms"], ["SEO", "content marketing"])
-        self.assertEqual(
-            normalized["topic_terms"],
-            ["Marketing", "SEO", "content marketing"],
-        )
+        self.assertEqual(normalized["topic_terms"], ["SEO", "content marketing"])
+        self.assertNotIn("Marketing", normalized["topic_terms"])
 
     def test_x_discovery_limits_are_configuration_driven(self):
         with (
@@ -345,7 +344,7 @@ class TestInfluencerOrchestrator(unittest.TestCase):
         self.assertEqual(pipeline_kwargs["company_id"], "company-1")
         self.assertEqual(pipeline_kwargs["company_name"], "Marketing Eye")
         self.assertEqual(pipeline_kwargs["company_domain"], "marketingeye.com.au")
-        self.assertEqual(pipeline_kwargs["related_terms"], ["Marketing", "SEO", "content marketing"])
+        self.assertEqual(pipeline_kwargs["related_terms"], ["SEO", "content marketing"])
         self.assertEqual(pipeline_kwargs["run_id"], "task-2")
         self.assertIsInstance(pipeline_kwargs["candidate_store"], orchestrator.CandidateStore)
         self.assertIs(pipeline_kwargs["candidate_store"].collection, candidate_collection)
@@ -498,6 +497,11 @@ class ResolveXSessionTests(unittest.TestCase):
         with patch.dict(os.environ, env, clear=False):
             self.assertIsNone(resolve_x_session())
 
+    def test_missing_cookie_pair_falls_back_to_x_session(self):
+        env = {**_SESSION_ENV, "X_SESSION": "auth_token=from-session; ct0=from-session"}
+        with patch.dict(os.environ, env, clear=False):
+            self.assertEqual(resolve_x_session(), "auth_token=from-session; ct0=from-session")
+
     def test_ct0_cookie_is_readable_by_page_javascript(self):
         cookies = {item["name"]: item for item in prepare_x_cookies("auth_token=token; ct0=ct0-value")}
         self.assertTrue(cookies["auth_token"].get("httpOnly"))
@@ -528,60 +532,74 @@ class _FakeCombinedPostFetcher:
         return self.page
 
 
-class TestSequentialProfileFetch(unittest.IsolatedAsyncioTestCase):
-    def _worker(self, post_fetcher) -> SequentialProfileWorker:
-        worker = SequentialProfileWorker(Settings())
-        worker.post_fetcher = post_fetcher
-        worker.profile_fetcher.fetch_one = lambda *args, **kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
-            AssertionError("identity must not use a second Chromium")
-        )
-        return worker
+class _FakeTimelineFetcher:
+    def __init__(self, posts):
+        self.posts = posts
+        self.handles: list[str] = []
+        self.x_session = "auth_token=token; ct0=ct0-value"
 
-    async def test_fetch_uses_one_authenticated_profile_visit(self) -> None:
+    async def fetch_one(self, handle: str, posts_per_profile: int = 5):
+        self.handles.append(handle)
+        return list(self.posts)
+
+
+class TestSequentialProfileFetch(unittest.IsolatedAsyncioTestCase):
+    async def test_profile_and_timeline_use_the_session(self) -> None:
         html = (
             '<title>Jane Doe (@janedoe) / X</title>'
             '<div class="font-bold">12K</div><div>Followers</div>'
         )
-        page = FetchedXProfilePage(
-            posts=[{"url": "https://x.com/janedoe/status/1", "text": "hello", "created_at": "2026-09-01T00:00:00.000Z"}],
-            html=html,
-        )
-        worker = self._worker(_FakeCombinedPostFetcher(page=page))
+        settings = Settings(x_session="auth_token=token; ct0=ct0-value")
+        worker = SequentialProfileWorker(settings)
+        profile_urls: list[str] = []
+
+        async def fetch_profile(url: str) -> FetchResult:
+            profile_urls.append(url)
+            return FetchResult(url=url, html=html, status="ok")
+
+        timeline = _FakeTimelineFetcher([
+            {"url": "https://x.com/janedoe/status/1", "text": "hello", "created_at": "2026-09-01T00:00:00.000Z"},
+        ])
+        worker.profile_fetcher.fetch_one = fetch_profile  # type: ignore[method-assign]
+        worker.post_fetcher = timeline  # type: ignore[assignment]
+
+        self.assertEqual(worker.profile_fetcher.x_session, settings.x_session)
+        self.assertEqual(settings.x_session, "auth_token=token; ct0=ct0-value")
         outcome = await worker.fetch("https://x.com/janedoe")
         self.assertIsNone(outcome.technical_error)
         assert outcome.profile is not None
         self.assertEqual(outcome.profile.handle, "janedoe")
         self.assertEqual(outcome.profile.followers.estimated, 12000)
+        self.assertEqual(profile_urls, ["https://x.com/janedoe"])
+        self.assertEqual(timeline.handles, ["janedoe"])
         self.assertEqual(len(outcome.recent_posts), 1)
 
-    async def test_blank_identity_raises_access_shell_recovery(self) -> None:
-        worker = self._worker(
-            _FakeCombinedPostFetcher(error=XAccessShellRecoveryRequired("Unexpected response: profile_identity_mismatch"))
-        )
-        with self.assertRaises(XAccessShellRecoveryRequired):
-            await worker.fetch("https://x.com/janedoe")
-
-    async def test_fetch_with_recovery_reopens_context_after_blank_shell(self) -> None:
+    async def test_rate_limited_profile_cools_down_once_then_retries(self) -> None:
         html = (
             '<title>Jane Doe (@janedoe) / X</title>'
             '<div class="font-bold">12K</div><div>Followers</div>'
         )
-        fetcher = _FakeCombinedPostFetcher()
+        worker = SequentialProfileWorker(Settings(x_session="auth_token=token; ct0=ct0-value"))
+        calls: list[str] = []
 
-        async def flaky_fetch(handle: str, posts_per_profile: int = 5) -> FetchedXProfilePage:
-            fetcher.calls.append(handle)
-            if len(fetcher.calls) == 1:
-                raise XAccessShellRecoveryRequired("Unexpected response: profile_identity_mismatch")
-            return FetchedXProfilePage(posts=[], html=html)
+        async def fetch_profile(url: str) -> FetchResult:
+            calls.append(url)
+            if len(calls) == 1:
+                return FetchResult(
+                    url=url, html=None, status="rate_limited",
+                    error="Unexpected response: rate_limited",
+                )
+            return FetchResult(url=url, html=html, status="ok")
 
-        fetcher.fetch_profile_and_posts = flaky_fetch  # type: ignore[method-assign]
-        worker = self._worker(fetcher)
-        with patch("x_influencer_discovery.pipeline.asyncio.sleep", new=AsyncMock()):
-            outcome = await worker.fetch_with_recovery("https://x.com/janedoe")
+        timeline = _FakeTimelineFetcher([])
+        worker.profile_fetcher.fetch_one = fetch_profile  # type: ignore[method-assign]
+        worker.post_fetcher = timeline  # type: ignore[assignment]
+        with patch("x_influencer_discovery.pipeline._X_ACCESS_SHELL_COOLDOWN_SECONDS", 0):
+            outcome = await worker.fetch("https://x.com/janedoe")
         self.assertIsNone(outcome.technical_error)
+        self.assertEqual(calls, ["https://x.com/janedoe", "https://x.com/janedoe"])
         assert outcome.profile is not None
         self.assertEqual(outcome.profile.handle, "janedoe")
-        self.assertEqual(fetcher.calls, ["janedoe", "janedoe"])
 
     async def test_batch_context_is_reused_by_nested_callers(self) -> None:
         fetcher = _FakeCombinedPostFetcher()
@@ -593,6 +611,26 @@ class TestSequentialProfileFetch(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(fetcher.has_batch_context())
             self.assertTrue(fetcher.has_batch_context())
         self.assertFalse(fetcher.has_batch_context())
+
+
+class TestResponseProblem(unittest.TestCase):
+    def test_missing_account_shell_is_profile_not_found(self):
+        html = "<html><body>This account doesn’t exist Try searching for another.</body></html>"
+        self.assertEqual(
+            _response_problem("https://x.com/missing", "https://x.com/missing", 200, html),
+            "profile_not_found",
+        )
+
+    def test_error_shell_without_profile_identity_is_rate_limited(self):
+        html = "<html><body>Something went wrong, but don’t fret — let’s give it another shot.</body></html>"
+        self.assertEqual(
+            _response_problem("https://x.com/jane", "https://x.com/jane", 200, html),
+            "rate_limited",
+        )
+
+    def test_rendered_profile_is_not_rate_limited_when_a_post_contains_the_phrase(self):
+        html = "<title>Jane (@jane) / X</title><p>Something went wrong in a tweet</p>"
+        self.assertIsNone(_response_problem("https://x.com/jane", "https://x.com/jane", 200, html))
 
 
 if __name__ == "__main__":

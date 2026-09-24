@@ -106,7 +106,7 @@ INFLUENCER_MINIMUM_RELEVANCE_SCORE = float(
     os.environ.get("MINIMUM_RELEVANCE_SCORE", "0.20")
 )
 INFLUENCER_GOOD_HYBRID_RELEVANCE_THRESHOLD = float(
-    os.environ.get("GOOD_HYBRID_RELEVANCE_THRESHOLD", "0.60")
+    os.environ.get("GOOD_HYBRID_RELEVANCE_THRESHOLD", "0.45")
 )
 INFLUENCER_FOLLOWING_MAX_SCROLLS = int(
     os.environ.get("FOLLOWING_MAX_SCROLLS", "8")
@@ -121,7 +121,7 @@ INFLUENCER_FETCH_LOG_DIR = Path(
     os.environ.get("X_FETCH_LOG_DIR", str(BASE_DIR / "logs"))
 )
 INFLUENCER_X_ACCESS_FAILURE_STREAK_LIMIT = int(
-    os.environ.get("X_ACCESS_FAILURE_STREAK_LIMIT", "3")
+    os.environ.get("X_ACCESS_FAILURE_STREAK_LIMIT", "5")
 )
 
 # Third-party API keys
@@ -152,7 +152,11 @@ REDDIT_SESSION = (os.environ.get("REDDIT_SESSION") or "").strip()
 REDDIT_TOKEN_V2 = (os.environ.get("REDDIT_TOKEN_V2") or "").strip()
 
 # MongoDB
-MONGODB_URI = os.environ.get("MONGODB_URI", "mongodb://localhost:27017")
+MONGODB_URI = (
+    os.environ.get("MONGODB_URI")
+    or os.environ.get("MONGODB_URL")
+    or "mongodb://localhost:27017"
+)
 MONGODB_DBNAME = os.environ.get("MONGODB_DBNAME", "pace_database")
 MONGODB_TLS = os.environ.get("MONGODB_TLS", "").lower() in ("1", "true", "yes")
 
